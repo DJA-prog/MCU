@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sensor Data Dashboard</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 15px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+            overflow: hidden;
+        }
+        
+        .header {
+            background: linear-gradient(135deg, #2196F3, #21CBF3);
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }
+        
+        .header h1 {
+            font-size: 2.5rem;
+            margin-bottom: 10px;
+        }
+        
+        .controls {
+            padding: 20px 30px;
+            background: #f8f9fa;
+            display: flex;
+            gap: 15px;
+            flex-wrap: wrap;
+        }
+        
+        .btn {
+            padding: 12px 24px;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: 600;
+            transition: all 0.3s ease;
+        }
+        
+        .btn-start {
+            background: #4CAF50;
+            color: white;
+        }
+        
+        .btn-stop {
+            background: #f44336;
+            color: white;
+        }
+        
+        .btn-refresh {
+            background: #2196F3;
+            color: white;
+        }
+        
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+        }
+        
+        .status-card {
+            background: white;
+            margin: 20px 30px;
+            padding: 25px;
+            border-radius: 12px;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.08);
+        }
+        
+        .status-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        
+        .metric-card {
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            color: white;
+            padding: 25px;
+            border-radius: 12px;
+            text-align: center;
+        }
+        
+        .metric-value {
+            font-size: 2.5rem;
+            font-weight: bold;
+            margin-bottom: 5px;
+        }
+        
+        .metric-label {
+            font-size: 0.9rem;
+            opacity: 0.9;
+        }
+        
+        .data-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 20px;
+        }
+        
+        .data-table th,
+        .data-table td {
+            padding: 12px 15px;
+            text-align: left;
+            border-bottom: 1px solid #ddd;
+        }
+        
+        .data-table th {
+            background: #f8f9fa;
+            font-weight: 600;
+        }
+        
+        .status-indicator {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            margin-right: 8px;
+        }
+        
+        .status-online {
+            background: #4CAF50;
+        }
+        
+        .status-offline {
+            background: #f44336;
+        }
+        
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #666;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🌡️ Sensor Data Dashboard</h1>
+            <p>Real-time monitoring of ESP8266 BME280 sensor</p>
+        </div>
+        
+        <div class="controls">
+            <button class="btn btn-start" onclick="startRecording()">📡 Start Recording</button>
+            <button class="btn btn-stop" onclick="stopRecording()">🛑 Stop Recording</button>
+            <button class="btn btn-refresh" onclick="refreshData()">🔄 Refresh</button>
+        </div>
+        
+        <div class="status-card">
+            <h2>📊 Current Status</h2>
+            <div id="status-info" class="loading">Loading status...</div>
+        </div>
+        
+        <div class="status-card">
+            <h2>📈 Latest Reading</h2>
+            <div class="status-grid">
+                <div class="metric-card">
+                    <div class="metric-value" id="temp-value">--</div>
+                    <div class="metric-label">Temperature (°C)</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-value" id="pressure-value">--</div>
+                    <div class="metric-label">Pressure (hPa)</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-value" id="altitude-value">--</div>
+                    <div class="metric-label">Altitude (m)</div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="status-card">
+            <h2>📋 Recent Readings</h2>
+            <div id="recent-data" class="loading">Loading recent data...</div>
+        </div>
+    </div>
+
+    <script>
+        const API_BASE = 'http://localhost:5000/api';
+        
+        async function apiCall(endpoint, method = 'GET') {
+            try {
+                const response = await fetch(`${API_BASE}${endpoint}`, {
+                    method: method,
+                    headers: {
+                        'Content-Type': 'application/json',
+                    }
+                });
+                return await response.json();
+            } catch (error) {
+                console.error('API call failed:', error);
+                return { status: 'error', message: error.message };
+            }
+        }
+        
+        async function updateStatus() {
+            const status = await apiCall('/status');
+            const statusInfo = document.getElementById('status-info');
+            
+            if (status.status === 'success') {
+                const data = status.data;
+                const statusClass = data.is_recording ? 'status-online' : 'status-offline';
+                const statusText = data.is_recording ? 'Recording' : 'Stopped';
+                
+                statusInfo.innerHTML = `
+                    <p><span class="status-indicator ${statusClass}"></span><strong>Status:</strong> ${statusText}</p>
+                    <p><strong>Connected to MQTT:</strong> ${data.is_connected ? 'Yes' : 'No'}</p>
+                    <p><strong>Total Readings:</strong> ${data.total_readings}</p>
+                    <p><strong>Start Time:</strong> ${data.start_time || 'Not started'}</p>
+                `;
+            } else {
+                statusInfo.innerHTML = `<p>❌ Error loading status: ${status.message}</p>`;
+            }
+        }
+        
+        async function updateLatestReading() {
+            const latest = await apiCall('/data/latest');
+            
+            if (latest.status === 'success' && latest.data) {
+                const data = latest.data;
+                document.getElementById('temp-value').textContent = data.temperature?.toFixed(1) || '--';
+                document.getElementById('pressure-value').textContent = data.pressure?.toFixed(1) || '--';
+                document.getElementById('altitude-value').textContent = data.altitude?.toFixed(0) || '--';
+            } else {
+                document.getElementById('temp-value').textContent = '--';
+                document.getElementById('pressure-value').textContent = '--';
+                document.getElementById('altitude-value').textContent = '--';
+            }
+        }
+        
+        async function updateRecentData() {
+            const recentData = await apiCall('/data?limit=10');
+            const recentDataDiv = document.getElementById('recent-data');
+            
+            if (recentData.status === 'success' && recentData.data.length > 0) {
+                let tableHTML = `
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>Time</th>
+                                <th>Temperature</th>
+                                <th>Pressure</th>
+                                <th>Altitude</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                `;
+                
+                recentData.data.reverse().forEach(reading => {
+                    const time = new Date(reading.timestamp_received).toLocaleTimeString();
+                    tableHTML += `
+                        <tr>
+                            <td>${time}</td>
+                            <td>${reading.temperature}°C</td>
+                            <td>${reading.pressure} hPa</td>
+                            <td>${reading.altitude} m</td>
+                        </tr>
+                    `;
+                });
+                
+                tableHTML += '</tbody></table>';
+                recentDataDiv.innerHTML = tableHTML;
+            } else {
+                recentDataDiv.innerHTML = '<p>No recent data available</p>';
+            }
+        }
+        
+        async function startRecording() {
+            const result = await apiCall('/start', 'POST');
+            if (result.status === 'success') {
+                alert('✅ Recording started successfully!');
+                setTimeout(refreshData, 2000); // Refresh after 2 seconds
+            } else {
+                alert(`❌ Failed to start recording: ${result.message}`);
+            }
+        }
+        
+        async function stopRecording() {
+            const result = await apiCall('/stop', 'POST');
+            if (result.status === 'success') {
+                alert('🛑 Recording stopped successfully!');
+                refreshData();
+            } else {
+                alert(`❌ Failed to stop recording: ${result.message}`);
+            }
+        }
+        
+        async function refreshData() {
+            await updateStatus();
+            await updateLatestReading();
+            await updateRecentData();
+        }
+        
+        // Initial load and auto-refresh
+        refreshData();
+        setInterval(refreshData, 5000); // Refresh every 5 seconds
+    </script>
+</body>
+</html>

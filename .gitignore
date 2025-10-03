@@ -5,3 +5,4 @@
 .vscode/ipch
 
 src/secrets.cpp
+scripts/venv
