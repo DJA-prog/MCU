@@ -38,19 +38,18 @@ CORS(app)
 recorder_instance = None
 recording_status = {"is_recording": False, "start_time": None}
 
-# Setup logging
+# Setup logging (console only, no file)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler(LOG_FILE),
         logging.StreamHandler()
     ]
 )
 
 class SensorDataRecorder:
     def __init__(self):
-        self.client = mqtt.Client()
+        self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
         self.setup_mqtt_client()
         self.setup_csv_file()
         self.is_connected = False
@@ -71,35 +70,45 @@ class SensorDataRecorder:
     def setup_csv_file(self):
         """Create CSV file with headers if it doesn't exist"""
         if not os.path.exists(DATA_FILE):
+            print(f"📁 Creating new CSV file: {DATA_FILE}")
             with open(DATA_FILE, 'w', newline='') as csvfile:
                 fieldnames = [
                     'timestamp_received', 'timestamp_device', 'device',
-                    'temperature', 'pressure', 'altitude'
+                    'temperature', 'humidity', 'pressure',
+                    'cooler_running', 'cooler_runtime', 'total_elapsed_time', 'cooler_ever_started', 'manual_override'
                 ]
                 writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
                 writer.writeheader()
-            logging.info(f"Created new CSV file: {DATA_FILE}")
+            print(f"✅ Created new CSV file with headers: {DATA_FILE}")
         else:
-            logging.info(f"Using existing CSV file: {DATA_FILE}")
+            print(f"📂 Using existing CSV file: {DATA_FILE}")
+            
+        # Check if file is readable
+        try:
+            with open(DATA_FILE, 'r') as f:
+                lines = f.readlines()
+                print(f"📊 CSV file has {len(lines)} lines")
+        except Exception as e:
+            print(f"⚠️  Warning reading CSV file: {e}")
     
-    def on_connect(self, client, userdata, flags, rc):
+    def on_connect(self, client, userdata, flags, rc, properties=None):
         """Callback for when the client connects to the broker"""
         if rc == 0:
             self.is_connected = True
-            logging.info("Connected to MQTT broker successfully")
+            print("🟢 Connected to MQTT broker successfully")
             client.subscribe(MQTT_TOPIC)
-            logging.info(f"Subscribed to topic: {MQTT_TOPIC}")
+            print(f"📡 Subscribed to topic: {MQTT_TOPIC}")
         else:
             self.is_connected = False
-            logging.error(f"Failed to connect to MQTT broker. Return code: {rc}")
+            print(f"🔴 Failed to connect to MQTT broker. Return code: {rc}")
     
-    def on_disconnect(self, client, userdata, rc):
+    def on_disconnect(self, client, userdata, flags, rc, properties=None):
         """Callback for when the client disconnects from the broker"""
         self.is_connected = False
         if rc != 0:
-            logging.warning("Unexpected disconnection from MQTT broker")
+            print("⚠️  Unexpected disconnection from MQTT broker")
         else:
-            logging.info("Disconnected from MQTT broker")
+            print("👋 Disconnected from MQTT broker")
     
     def on_log(self, client, userdata, level, buf):
         """Callback for MQTT client logging"""
@@ -110,10 +119,11 @@ class SensorDataRecorder:
         try:
             # Decode the message
             message = msg.payload.decode('utf-8')
-            logging.info(f"Received message: {message}")
+            print(f"📡 Raw MQTT message: {message}")
             
             # Parse JSON data
             data = json.loads(message)
+            print(f"📊 Parsed data: {data}")
             
             # Add receive timestamp
             receive_time = datetime.now()
@@ -131,9 +141,16 @@ class SensorDataRecorder:
                 'timestamp_device': data.get('timestamp', ''),
                 'device': data.get('device', 'unknown'),
                 'temperature': data.get('temperature', ''),
+                'humidity': data.get('humidity', ''),
                 'pressure': data.get('pressure', ''),
-                'altitude': data.get('altitude', '')
+                'cooler_running': data.get('cooler_running', ''),
+                'cooler_runtime': data.get('cooler_runtime', ''),
+                'total_elapsed_time': data.get('total_elapsed_time', ''),
+                'cooler_ever_started': data.get('cooler_ever_started', ''),
+                'manual_override': data.get('manual_override', '')
             }
+            
+            print(f"💾 CSV data to write: {csv_data}")
             
             # Write to CSV file
             self.write_to_csv(csv_data)
@@ -142,36 +159,57 @@ class SensorDataRecorder:
             self.display_data(data, receive_time)
             
         except json.JSONDecodeError as e:
-            logging.error(f"Failed to parse JSON: {e}")
-            logging.error(f"Raw message: {message}")
+            print(f"❌ Failed to parse JSON: {e}")
+            print(f"Raw message: {message}")
         except Exception as e:
-            logging.error(f"Error processing message: {e}")
+            print(f"❌ Error processing message: {e}")
     
     def write_to_csv(self, data):
         """Write data to CSV file"""
         try:
+            print(f"📝 Writing to CSV file: {DATA_FILE}")
             with open(DATA_FILE, 'a', newline='') as csvfile:
                 fieldnames = [
                     'timestamp_received', 'timestamp_device', 'device',
-                    'temperature', 'pressure', 'altitude'
+                    'temperature', 'humidity', 'pressure',
+                    'cooler_running', 'cooler_runtime', 'total_elapsed_time', 'cooler_ever_started', 'manual_override'
                 ]
                 writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
                 writer.writerow(data)
-            logging.debug("Data written to CSV successfully")
+            print("✅ Data written to CSV successfully")
         except Exception as e:
-            logging.error(f"Failed to write to CSV: {e}")
+            print(f"❌ Failed to write to CSV: {e}")
     
     def display_data(self, data, receive_time):
         """Display formatted sensor data"""
-        print("\n" + "="*50)
+        print("\n" + "="*60)
         print(f"📊 SENSOR READING - {receive_time.strftime('%Y-%m-%d %H:%M:%S')}")
-        print("="*50)
+        print("="*60)
         print(f"🌡️  Temperature: {data.get('temperature', 'N/A')}°C")
+        print(f"💧 Humidity:    {data.get('humidity', 'N/A')}%")
         print(f"🏔️  Pressure:    {data.get('pressure', 'N/A')} hPa")
-        print(f"📏 Altitude:    {data.get('altitude', 'N/A')} m")
         print(f"📱 Device:      {data.get('device', 'N/A')}")
-        print(f"⏰ Device Time: {data.get('timestamp', 'N/A')} ms")
-        print("="*50)
+        print(f"⏰ Device Time: {data.get('timestamp', 'N/A')} s")
+        
+        # Display cooler information if available
+        cooler_running = data.get('cooler_running')
+        manual_override = data.get('manual_override', False)
+        
+        if cooler_running is not None:
+            print("-" * 30 + " COOLER STATUS " + "-" * 30)
+            mode = "MANUAL" if manual_override else "AUTO"
+            status_icon = "🧊 RUNNING" if cooler_running else "⏸️  STOPPED"
+            print(f"❄️  Cooler:     {status_icon} ({mode})")
+            
+            cooler_runtime = data.get('cooler_runtime', 0)
+            total_elapsed = data.get('total_elapsed_time', 0)
+            ever_started = data.get('cooler_ever_started', False)
+            
+            if ever_started:
+                print(f"⏱️  Runtime:    {cooler_runtime:.1f} seconds")
+                print(f"📈 Elapsed:    {total_elapsed:.1f} seconds")
+        
+        print("="*60)
     
     def connect_and_start(self):
         """Connect to MQTT broker and start listening"""
@@ -501,6 +539,84 @@ def health_check():
         "timestamp": datetime.now().isoformat()
     })
 
+@app.route('/api/cooler/on', methods=['POST'])
+def turn_cooler_on():
+    """Turn cooler ON manually via MQTT"""
+    global recorder_instance
+    
+    try:
+        if not recorder_instance or not recorder_instance.is_connected:
+            return jsonify({
+                "status": "error",
+                "message": "MQTT not connected"
+            }), 503
+        
+        # Publish MQTT command to turn cooler ON
+        recorder_instance.client.publish("sensors/cooler/control", "ON")
+        
+        return jsonify({
+            "status": "success",
+            "message": "Cooler turned ON"
+        })
+        
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": f"Failed to control cooler: {str(e)}"
+        }), 500
+
+@app.route('/api/cooler/off', methods=['POST'])
+def turn_cooler_off():
+    """Turn cooler OFF manually via MQTT"""
+    global recorder_instance
+    
+    try:
+        if not recorder_instance or not recorder_instance.is_connected:
+            return jsonify({
+                "status": "error",
+                "message": "MQTT not connected"
+            }), 503
+        
+        # Publish MQTT command to turn cooler OFF
+        recorder_instance.client.publish("sensors/cooler/control", "OFF")
+        
+        return jsonify({
+            "status": "success",
+            "message": "Cooler turned OFF"
+        })
+        
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": f"Failed to control cooler: {str(e)}"
+        }), 500
+
+@app.route('/api/cooler/auto', methods=['POST'])
+def set_cooler_auto():
+    """Set cooler to automatic temperature control via MQTT"""
+    global recorder_instance
+    
+    try:
+        if not recorder_instance or not recorder_instance.is_connected:
+            return jsonify({
+                "status": "error",
+                "message": "MQTT not connected"
+            }), 503
+        
+        # Publish MQTT command to set cooler to auto mode
+        recorder_instance.client.publish("sensors/cooler/control", "AUTO")
+        
+        return jsonify({
+            "status": "success",
+            "message": "Cooler set to automatic mode"
+        })
+        
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": f"Failed to control cooler: {str(e)}"
+        }), 500
+
 @app.route('/', methods=['GET'])
 def index():
     """API documentation"""
@@ -515,7 +631,10 @@ def index():
             "GET /api/data": "Get sensor data (params: limit, start_date, end_date)",
             "GET /api/data/latest": "Get latest reading",
             "GET /api/data/stats": "Get data statistics",
-            "GET /api/config": "Get configuration"
+            "GET /api/config": "Get configuration",
+            "POST /api/cooler/on": "Turn cooler ON manually",
+            "POST /api/cooler/off": "Turn cooler OFF manually",
+            "POST /api/cooler/auto": "Set cooler to automatic mode"
         }
     })
 

@@ -8,7 +8,7 @@ import sys
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                             QHBoxLayout, QGridLayout, QPushButton, QLabel, 
                             QLineEdit, QCheckBox, QGroupBox, QMessageBox,
-                            QSplitter, QFrame)
+                            QSplitter, QFrame, QTabWidget)
 from PyQt5.QtCore import QTimer, QThread, pyqtSignal, Qt
 from PyQt5.QtGui import QFont, QPalette, QColor
 import matplotlib.pyplot as plt
@@ -59,7 +59,7 @@ class DataWorker(QThread):
     
     def fetch_data(self):
         """Fetch data from API"""
-        result = self.api_call('/data?limit=100')
+        result = self.api_call('/data?limit=500')
         if result.get('status') == 'success':
             self.data_received.emit(result['data'])
         else:
@@ -74,19 +74,35 @@ class DataWorker(QThread):
         """Stop recording"""
         result = self.api_call('/stop', 'POST')
         return result
+    
+    def cooler_on(self):
+        """Turn cooler ON"""
+        result = self.api_call('/cooler/on', 'POST')
+        return result
+    
+    def cooler_off(self):
+        """Turn cooler OFF"""
+        result = self.api_call('/cooler/off', 'POST')
+        return result
+    
+    def cooler_auto(self):
+        """Set cooler to automatic mode"""
+        result = self.api_call('/cooler/auto', 'POST')
+        return result
 
 class SensorPlotGUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("🌡️ Sensor Data Plotter - Qt5")
+        self.setWindowTitle("Sensor Data Plotter - Qt5")
         self.setGeometry(100, 100, 1400, 900)
         
         # API configuration
-        self.api_base = "http://localhost:5000/api"
+        self.api_base = "http://localhost:5002/api"
         
         # Data storage
         self.time_data = []
         self.temperature_data = []
+        self.humidity_data = []
         self.pressure_data = []
         self.start_time = None
         
@@ -130,31 +146,53 @@ class SensorPlotGUI(QMainWindow):
         
     def create_control_panel(self, parent_layout):
         """Create control buttons and settings"""
-        control_group = QGroupBox("📡 Controls")
+        control_group = QGroupBox("Controls")
         control_layout = QHBoxLayout(control_group)
         
         # Control buttons
         button_layout = QHBoxLayout()
         
-        self.start_btn = QPushButton("▶️ Start Recording")
+        self.start_btn = QPushButton("Start Recording")
         self.start_btn.clicked.connect(self.start_recording)
         self.start_btn.setMinimumHeight(35)
         button_layout.addWidget(self.start_btn)
         
-        self.stop_btn = QPushButton("⏹️ Stop Recording")
+        self.stop_btn = QPushButton("Stop Recording")
         self.stop_btn.clicked.connect(self.stop_recording)
         self.stop_btn.setMinimumHeight(35)
         button_layout.addWidget(self.stop_btn)
         
-        self.refresh_btn = QPushButton("🔄 Refresh Data")
+        self.refresh_btn = QPushButton("Refresh Data")
         self.refresh_btn.clicked.connect(self.manual_refresh)
         self.refresh_btn.setMinimumHeight(35)
         button_layout.addWidget(self.refresh_btn)
         
-        self.clear_btn = QPushButton("🗑️ Clear Plot")
+        self.clear_btn = QPushButton("Clear Plot")
         self.clear_btn.clicked.connect(self.clear_data)
         self.clear_btn.setMinimumHeight(35)
         button_layout.addWidget(self.clear_btn)
+        
+        # Add separator
+        button_layout.addStretch()
+        
+        # Cooler control buttons
+        self.cooler_on_btn = QPushButton("Cooler ON")
+        self.cooler_on_btn.clicked.connect(self.turn_cooler_on)
+        self.cooler_on_btn.setMinimumHeight(35)
+        self.cooler_on_btn.setStyleSheet("background-color: #28a745;")
+        button_layout.addWidget(self.cooler_on_btn)
+        
+        self.cooler_off_btn = QPushButton("Cooler OFF")
+        self.cooler_off_btn.clicked.connect(self.turn_cooler_off)
+        self.cooler_off_btn.setMinimumHeight(35)
+        self.cooler_off_btn.setStyleSheet("background-color: #dc3545;")
+        button_layout.addWidget(self.cooler_off_btn)
+        
+        self.cooler_auto_btn = QPushButton("Auto Mode")
+        self.cooler_auto_btn.clicked.connect(self.set_cooler_auto)
+        self.cooler_auto_btn.setMinimumHeight(35)
+        self.cooler_auto_btn.setStyleSheet("background-color: #ffc107; color: black;")
+        button_layout.addWidget(self.cooler_auto_btn)
         
         button_layout.addStretch()
         
@@ -185,21 +223,21 @@ class SensorPlotGUI(QMainWindow):
         
     def create_status_panel(self, parent_layout):
         """Create status information panel"""
-        status_group = QGroupBox("📊 Status")
+        status_group = QGroupBox("Status")
         status_layout = QHBoxLayout(status_group)
         
         # Status indicators
         status_left = QHBoxLayout()
         
-        self.connection_label = QLabel("🔴 Disconnected")
+        self.connection_label = QLabel("Disconnected")
         self.connection_label.setStyleSheet("color: red; font-weight: bold;")
         status_left.addWidget(self.connection_label)
         
-        self.recording_label = QLabel("⏸️ Not Recording")
+        self.recording_label = QLabel("Not Recording")
         self.recording_label.setStyleSheet("color: orange; font-weight: bold;")
         status_left.addWidget(self.recording_label)
         
-        self.data_count_label = QLabel("📈 Data Points: 0")
+        self.data_count_label = QLabel("Data Points: 0")
         status_left.addWidget(self.data_count_label)
         
         status_left.addStretch()
@@ -207,13 +245,21 @@ class SensorPlotGUI(QMainWindow):
         # Current readings
         status_right = QHBoxLayout()
         
-        self.temp_label = QLabel("🌡️ Temp: -- °C")
+        self.temp_label = QLabel("Temp: -- °C")
         self.temp_label.setStyleSheet("font-weight: bold; font-size: 12px;")
         status_right.addWidget(self.temp_label)
         
-        self.pressure_label = QLabel("🏔️ Pressure: -- hPa")
+        self.pressure_label = QLabel("Pressure: -- hPa")
         self.pressure_label.setStyleSheet("font-weight: bold; font-size: 12px;")
         status_right.addWidget(self.pressure_label)
+        
+        self.humidity_label = QLabel("Humidity: -- %")
+        self.humidity_label.setStyleSheet("font-weight: bold; font-size: 12px;")
+        status_right.addWidget(self.humidity_label)
+        
+        self.cooler_status_label = QLabel("Cooler: --")
+        self.cooler_status_label.setStyleSheet("font-weight: bold; font-size: 12px;")
+        status_right.addWidget(self.cooler_status_label)
         
         # Combine layouts
         status_layout.addLayout(status_left)
@@ -223,48 +269,158 @@ class SensorPlotGUI(QMainWindow):
         parent_layout.addWidget(status_group)
         
     def create_plot_area(self, parent_layout):
-        """Create matplotlib plotting area"""
-        plot_group = QGroupBox("📈 Real-time Sensor Data")
+        """Create matplotlib plotting area with tabs"""
+        plot_group = QGroupBox("Real-time Sensor Data")
         plot_layout = QVBoxLayout(plot_group)
         
-        # Create matplotlib figure
-        self.figure = Figure(figsize=(14, 8), facecolor='white')
-        self.canvas = FigureCanvas(self.figure)
+        # Create tab widget
+        self.tab_widget = QTabWidget()
         
-        # Create subplots
-        self.ax1 = self.figure.add_subplot(211)
-        self.ax2 = self.figure.add_subplot(212)
+        # Create individual tabs
+        self.create_temperature_tab()
+        self.create_humidity_tab()
+        self.create_pressure_tab()
+        self.create_overview_tab()
+        
+        plot_layout.addWidget(self.tab_widget)
+        parent_layout.addWidget(plot_group)
+    
+    def create_temperature_tab(self):
+        """Create temperature plot tab"""
+        temp_widget = QWidget()
+        temp_layout = QVBoxLayout(temp_widget)
+        
+        # Create matplotlib figure for temperature
+        self.temp_figure = Figure(figsize=(12, 6), facecolor='white')
+        self.temp_canvas = FigureCanvas(self.temp_figure)
+        self.temp_ax = self.temp_figure.add_subplot(111)
         
         # Add navigation toolbar
-        self.toolbar = NavigationToolbar(self.canvas, self)
+        temp_toolbar = NavigationToolbar(self.temp_canvas, temp_widget)
         
-        plot_layout.addWidget(self.toolbar)
-        plot_layout.addWidget(self.canvas)
+        temp_layout.addWidget(temp_toolbar)
+        temp_layout.addWidget(self.temp_canvas)
         
-        parent_layout.addWidget(plot_group)
+        self.tab_widget.addTab(temp_widget, "Temperature")
+    
+    def create_humidity_tab(self):
+        """Create humidity plot tab"""
+        humidity_widget = QWidget()
+        humidity_layout = QVBoxLayout(humidity_widget)
+        
+        # Create matplotlib figure for humidity
+        self.humidity_figure = Figure(figsize=(12, 6), facecolor='white')
+        self.humidity_canvas = FigureCanvas(self.humidity_figure)
+        self.humidity_ax = self.humidity_figure.add_subplot(111)
+        
+        # Add navigation toolbar
+        humidity_toolbar = NavigationToolbar(self.humidity_canvas, humidity_widget)
+        
+        humidity_layout.addWidget(humidity_toolbar)
+        humidity_layout.addWidget(self.humidity_canvas)
+        
+        self.tab_widget.addTab(humidity_widget, "Humidity")
+    
+    def create_pressure_tab(self):
+        """Create pressure plot tab"""
+        pressure_widget = QWidget()
+        pressure_layout = QVBoxLayout(pressure_widget)
+        
+        # Create matplotlib figure for pressure
+        self.pressure_figure = Figure(figsize=(12, 6), facecolor='white')
+        self.pressure_canvas = FigureCanvas(self.pressure_figure)
+        self.pressure_ax = self.pressure_figure.add_subplot(111)
+        
+        # Add navigation toolbar
+        pressure_toolbar = NavigationToolbar(self.pressure_canvas, pressure_widget)
+        
+        pressure_layout.addWidget(pressure_toolbar)
+        pressure_layout.addWidget(self.pressure_canvas)
+        
+        self.tab_widget.addTab(pressure_widget, "Pressure")
+    
+    def create_overview_tab(self):
+        """Create overview tab with all plots"""
+        overview_widget = QWidget()
+        overview_layout = QVBoxLayout(overview_widget)
+        
+        # Create matplotlib figure for overview
+        self.overview_figure = Figure(figsize=(12, 8), facecolor='white')
+        self.overview_canvas = FigureCanvas(self.overview_figure)
+        
+        # Create subplots for overview
+        self.overview_ax1 = self.overview_figure.add_subplot(311)
+        self.overview_ax2 = self.overview_figure.add_subplot(312)
+        self.overview_ax3 = self.overview_figure.add_subplot(313)
+        
+        # Add navigation toolbar
+        overview_toolbar = NavigationToolbar(self.overview_canvas, overview_widget)
+        
+        overview_layout.addWidget(overview_toolbar)
+        overview_layout.addWidget(self.overview_canvas)
+        
+        self.tab_widget.addTab(overview_widget, "Overview")
         
     def setup_plots(self):
         """Initialize plot configuration"""
-        self.setup_plot_styling()
+        self.setup_individual_plot_styling()
+        self.setup_overview_plot_styling()
         
-    def setup_plot_styling(self):
-        """Configure plot appearance"""
+    def setup_individual_plot_styling(self):
+        """Configure individual plot appearance"""
         # Temperature plot
-        self.ax1.set_title('🌡️ Temperature vs Time', fontsize=14, fontweight='bold', pad=20)
-        self.ax1.set_ylabel('Temperature (°C)', fontsize=12)
-        self.ax1.grid(True, alpha=0.3)
-        self.ax1.set_facecolor('#f8f9fa')
+        self.temp_ax.set_title('Temperature vs Time', fontsize=14, fontweight='bold', pad=20)
+        self.temp_ax.set_xlabel('Time (seconds since start)', fontsize=12)
+        self.temp_ax.set_ylabel('Temperature (°C)', fontsize=12)
+        self.temp_ax.grid(True, alpha=0.3)
+        self.temp_ax.set_facecolor('#f8f9fa')
+        
+        # Humidity plot
+        self.humidity_ax.set_title('Humidity vs Time', fontsize=14, fontweight='bold', pad=20)
+        self.humidity_ax.set_xlabel('Time (seconds since start)', fontsize=12)
+        self.humidity_ax.set_ylabel('Humidity (%)', fontsize=12)
+        self.humidity_ax.grid(True, alpha=0.3)
+        self.humidity_ax.set_facecolor('#f8f9fa')
         
         # Pressure plot
-        self.ax2.set_title('🏔️ Pressure vs Time', fontsize=14, fontweight='bold', pad=20)
-        self.ax2.set_xlabel('Time (seconds since start)', fontsize=12)
-        self.ax2.set_ylabel('Pressure (hPa)', fontsize=12)
-        self.ax2.grid(True, alpha=0.3)
-        self.ax2.set_facecolor('#f8f9fa')
+        self.pressure_ax.set_title('Pressure vs Time', fontsize=14, fontweight='bold', pad=20)
+        self.pressure_ax.set_xlabel('Time (seconds since start)', fontsize=12)
+        self.pressure_ax.set_ylabel('Pressure (hPa)', fontsize=12)
+        self.pressure_ax.grid(True, alpha=0.3)
+        self.pressure_ax.set_facecolor('#f8f9fa')
+        
+        # Draw individual canvases
+        self.temp_figure.tight_layout(pad=3.0)
+        self.humidity_figure.tight_layout(pad=3.0)
+        self.pressure_figure.tight_layout(pad=3.0)
+        self.temp_canvas.draw()
+        self.humidity_canvas.draw()
+        self.pressure_canvas.draw()
+    
+    def setup_overview_plot_styling(self):
+        """Configure overview plot appearance"""
+        # Temperature plot
+        self.overview_ax1.set_title('Temperature vs Time', fontsize=12, fontweight='bold')
+        self.overview_ax1.set_ylabel('Temperature (°C)', fontsize=10)
+        self.overview_ax1.grid(True, alpha=0.3)
+        self.overview_ax1.set_facecolor('#f8f9fa')
+        
+        # Humidity plot
+        self.overview_ax2.set_title('Humidity vs Time', fontsize=12, fontweight='bold')
+        self.overview_ax2.set_ylabel('Humidity (%)', fontsize=10)
+        self.overview_ax2.grid(True, alpha=0.3)
+        self.overview_ax2.set_facecolor('#f8f9fa')
+        
+        # Pressure plot
+        self.overview_ax3.set_title('Pressure vs Time', fontsize=12, fontweight='bold')
+        self.overview_ax3.set_xlabel('Time (seconds since start)', fontsize=10)
+        self.overview_ax3.set_ylabel('Pressure (hPa)', fontsize=10)
+        self.overview_ax3.grid(True, alpha=0.3)
+        self.overview_ax3.set_facecolor('#f8f9fa')
         
         # Adjust layout
-        self.figure.tight_layout(pad=3.0)
-        self.canvas.draw()
+        self.overview_figure.tight_layout(pad=2.0)
+        self.overview_canvas.draw()
         
     def apply_styles(self):
         """Apply modern Qt5 styling"""
@@ -348,13 +504,18 @@ class SensorPlotGUI(QMainWindow):
     def start_recording(self):
         """Start MQTT recording via API"""
         def start_async():
-            result = self.worker.start_recording()
-            if result.get('status') == 'success':
-                QMessageBox.information(self, "Success", "Recording started!")
-                QTimer.singleShot(2000, self.update_status)  # Update status after 2 seconds
-            else:
-                message = result.get('message', 'Unknown error')
-                QMessageBox.critical(self, "Error", f"Failed to start: {message}")
+            try:
+                result = self.worker.start_recording()
+                if result.get('status') == 'success':
+                    # Use Qt's signal mechanism to show message box in main thread
+                    self.show_success_message("Recording started!")
+                    # Update status after 2 seconds
+                    QTimer.singleShot(2000, self.update_status)
+                else:
+                    message = result.get('message', 'Unknown error')
+                    self.show_error_message(f"Failed to start: {message}")
+            except Exception as e:
+                self.show_error_message(f"Error starting recording: {str(e)}")
         
         # Run in separate thread to avoid blocking UI
         threading.Thread(target=start_async, daemon=True).start()
@@ -362,15 +523,72 @@ class SensorPlotGUI(QMainWindow):
     def stop_recording(self):
         """Stop MQTT recording via API"""
         def stop_async():
-            result = self.worker.stop_recording()
-            if result.get('status') == 'success':
-                QMessageBox.information(self, "Success", "Recording stopped!")
-                self.update_status()
-            else:
-                message = result.get('message', 'Unknown error')
-                QMessageBox.critical(self, "Error", f"Failed to stop: {message}")
+            try:
+                result = self.worker.stop_recording()
+                if result.get('status') == 'success':
+                    self.show_success_message("Recording stopped!")
+                    self.update_status()
+                else:
+                    message = result.get('message', 'Unknown error')
+                    self.show_error_message(f"Failed to stop: {message}")
+            except Exception as e:
+                self.show_error_message(f"Error stopping recording: {str(e)}")
         
+        # Run in separate thread to avoid blocking UI
         threading.Thread(target=stop_async, daemon=True).start()
+    
+    def show_success_message(self, message):
+        """Show success message in main thread"""
+        print(f"Success: {message}")
+    
+    def show_error_message(self, message):
+        """Show error message in main thread"""
+        print(f"Error: {message}")
+    
+    def turn_cooler_on(self):
+        """Turn cooler ON via API"""
+        def cooler_on_async():
+            try:
+                result = self.worker.cooler_on()
+                if result.get('status') == 'success':
+                    self.show_success_message("Cooler turned ON!")
+                else:
+                    message = result.get('message', 'Unknown error')
+                    self.show_error_message(f"Failed to turn cooler ON: {message}")
+            except Exception as e:
+                self.show_error_message(f"Error controlling cooler: {str(e)}")
+        
+        threading.Thread(target=cooler_on_async, daemon=True).start()
+    
+    def turn_cooler_off(self):
+        """Turn cooler OFF via API"""
+        def cooler_off_async():
+            try:
+                result = self.worker.cooler_off()
+                if result.get('status') == 'success':
+                    self.show_success_message("Cooler turned OFF!")
+                else:
+                    message = result.get('message', 'Unknown error')
+                    self.show_error_message(f"Failed to turn cooler OFF: {message}")
+            except Exception as e:
+                self.show_error_message(f"Error controlling cooler: {str(e)}")
+        
+        threading.Thread(target=cooler_off_async, daemon=True).start()
+    
+    def set_cooler_auto(self):
+        """Set cooler to automatic mode via API"""
+        def cooler_auto_async():
+            try:
+                result = self.worker.cooler_auto()
+                if result.get('status') == 'success':
+                    self.show_success_message("Cooler set to automatic mode!")
+                else:
+                    message = result.get('message', 'Unknown error')
+                    self.show_error_message(f"Failed to set cooler to auto: {message}")
+            except Exception as e:
+                self.show_error_message(f"Error controlling cooler: {str(e)}")
+        
+        threading.Thread(target=cooler_auto_async, daemon=True).start()
         
     def update_api_base(self):
         """Update API base URL"""
@@ -388,6 +606,7 @@ class SensorPlotGUI(QMainWindow):
         """Clear all plotted data"""
         self.time_data.clear()
         self.temperature_data.clear()
+        self.humidity_data.clear()
         self.pressure_data.clear()
         self.start_time = None
         self.update_plots()
@@ -405,29 +624,48 @@ class SensorPlotGUI(QMainWindow):
         """Update status labels with current data"""
         # Connection status
         self.is_connected = True
-        self.connection_label.setText("🟢 Connected")
+        self.connection_label.setText("Connected")
         self.connection_label.setStyleSheet("color: green; font-weight: bold;")
         
         # Recording status
         self.is_recording = status_data.get('is_recording', False)
         if self.is_recording:
-            self.recording_label.setText("� Recording")
+            self.recording_label.setText("Recording")
             self.recording_label.setStyleSheet("color: red; font-weight: bold;")
         else:
-            self.recording_label.setText("⏸️ Not Recording")
+            self.recording_label.setText("Not Recording")
             self.recording_label.setStyleSheet("color: orange; font-weight: bold;")
         
         # Data count
         total_readings = status_data.get('total_readings', 0)
-        self.data_count_label.setText(f"📈 Total Readings: {total_readings}")
+        self.data_count_label.setText(f"Total Readings: {total_readings}")
         
         # Latest reading
         latest = status_data.get('last_reading')
         if latest:
             temp = latest.get('temperature', '--')
             pressure = latest.get('pressure', '--')
-            self.temp_label.setText(f"🌡️ Temp: {temp} °C")
-            self.pressure_label.setText(f"🏔️ Pressure: {pressure} hPa")
+            humidity = latest.get('humidity', '--')
+            cooler_running = latest.get('cooler_running', False)
+            manual_override = latest.get('manual_override', False)
+            
+            self.temp_label.setText(f"Temp: {temp} °C")
+            self.pressure_label.setText(f"Pressure: {pressure} hPa")
+            self.humidity_label.setText(f"Humidity: {humidity} %")
+            
+            # Cooler status
+            if cooler_running is not None:
+                mode = "MANUAL" if manual_override else "AUTO"
+                status = "ON" if cooler_running else "OFF"
+                self.cooler_status_label.setText(f"Cooler: {status} ({mode})")
+                
+                if cooler_running:
+                    self.cooler_status_label.setStyleSheet("color: green; font-weight: bold; font-size: 12px;")
+                else:
+                    self.cooler_status_label.setStyleSheet("color: red; font-weight: bold; font-size: 12px;")
+            else:
+                self.cooler_status_label.setText("Cooler: --")
+                self.cooler_status_label.setStyleSheet("color: gray; font-weight: bold; font-size: 12px;")
         
     def show_error(self, message):
         """Show error message and update disconnected status"""
@@ -436,12 +674,14 @@ class SensorPlotGUI(QMainWindow):
         # Update status to disconnected
         self.is_connected = False
         self.is_recording = False
-        self.connection_label.setText("🔴 Disconnected")
+        self.connection_label.setText("Disconnected")
         self.connection_label.setStyleSheet("color: red; font-weight: bold;")
-        self.recording_label.setText("⏸️ Not Recording")
+        self.recording_label.setText("Not Recording")
         self.recording_label.setStyleSheet("color: orange; font-weight: bold;")
-        self.temp_label.setText("🌡️ Temp: -- °C")
-        self.pressure_label.setText("🏔️ Pressure: -- hPa")
+        self.temp_label.setText("Temp: -- °C")
+        self.pressure_label.setText("Pressure: -- hPa")
+        self.humidity_label.setText("Humidity: -- %")
+        self.cooler_status_label.setText("Cooler: --")
         
     def process_new_data(self, readings):
         """Process new data and update plots"""
@@ -451,26 +691,43 @@ class SensorPlotGUI(QMainWindow):
         # Clear existing data
         self.time_data.clear()
         self.temperature_data.clear()
+        self.humidity_data.clear()
         self.pressure_data.clear()
         
         # Set start time from first reading
         if readings:
             try:
-                self.start_time = datetime.fromisoformat(readings[0]['timestamp_received'].replace('Z', '+00:00'))
-            except:
+                first_timestamp = readings[0]['timestamp_received']
+                if isinstance(first_timestamp, (int, float)):
+                    # If timestamp is a number, treat it as Unix timestamp
+                    self.start_time = datetime.fromtimestamp(first_timestamp)
+                else:
+                    # If timestamp is a string, parse it
+                    self.start_time = datetime.fromisoformat(str(first_timestamp).replace('Z', '+00:00'))
+            except (ValueError, KeyError, TypeError):
                 self.start_time = datetime.now()
         
         # Process all readings
         for reading in readings:
             try:
-                timestamp = datetime.fromisoformat(reading['timestamp_received'].replace('Z', '+00:00'))
+                timestamp_val = reading['timestamp_received']
+                
+                if isinstance(timestamp_val, (int, float)):
+                    # If timestamp is a number, treat it as Unix timestamp
+                    timestamp = datetime.fromtimestamp(timestamp_val)
+                else:
+                    # If timestamp is a string, parse it
+                    timestamp = datetime.fromisoformat(str(timestamp_val).replace('Z', '+00:00'))
+                
                 seconds_since_start = (timestamp - self.start_time).total_seconds()
                 
                 temperature = float(reading.get('temperature', 0))
+                humidity = float(reading.get('humidity', 0))
                 pressure = float(reading.get('pressure', 0))
                 
                 self.time_data.append(seconds_since_start)
                 self.temperature_data.append(temperature)
+                self.humidity_data.append(humidity)
                 self.pressure_data.append(pressure)
                 
             except (ValueError, TypeError, KeyError) as e:
@@ -483,44 +740,159 @@ class SensorPlotGUI(QMainWindow):
     def update_plots(self):
         """Update matplotlib plots with current data"""
         try:
-            # Clear previous plots
-            self.ax1.clear()
-            self.ax2.clear()
-            
-            # Reapply styling
-            self.setup_plot_styling()
-            
-            if self.time_data and self.temperature_data and self.pressure_data:
-                # Plot temperature
-                self.ax1.plot(self.time_data, self.temperature_data, 
-                             'o-', linewidth=2, markersize=4, 
-                             label='Temperature', color='#e74c3c')
-                self.ax1.legend()
-                
-                # Plot pressure
-                self.ax2.plot(self.time_data, self.pressure_data, 
-                             's-', linewidth=2, markersize=4, 
-                             label='Pressure', color='#3498db')
-                self.ax2.legend()
-                
-                # Set axis limits with some padding
-                if len(self.time_data) > 1:
-                    time_range = max(self.time_data) - min(self.time_data)
-                    padding = max(time_range * 0.05, 1)  # Minimum 1 second padding
-                    self.ax1.set_xlim(min(self.time_data) - padding, 
-                                     max(self.time_data) + padding)
-                    self.ax2.set_xlim(min(self.time_data) - padding, 
-                                     max(self.time_data) + padding)
-            
             # Update data count
             data_count = len(self.time_data)
-            self.data_count_label.setText(f"📈 Data Points: {data_count}")
+            self.data_count_label.setText(f"Data Points: {data_count}")
             
-            # Refresh canvas
-            self.canvas.draw()
-            
+            if self.time_data and self.temperature_data and self.humidity_data and self.pressure_data:
+                # Update individual plot tabs
+                self.update_temperature_plot()
+                self.update_humidity_plot()
+                self.update_pressure_plot()
+                self.update_overview_plot()
+            else:
+                # Clear all plots if no data
+                self.clear_all_plots()
+                
         except Exception as e:
             print(f"Error updating plots: {e}")
+    
+    def update_temperature_plot(self):
+        """Update temperature plot"""
+        self.temp_ax.clear()
+        self.temp_ax.set_title('Temperature vs Time', fontsize=14, fontweight='bold', pad=20)
+        self.temp_ax.set_xlabel('Time (seconds since start)', fontsize=12)
+        self.temp_ax.set_ylabel('Temperature (°C)', fontsize=12)
+        self.temp_ax.grid(True, alpha=0.3)
+        self.temp_ax.set_facecolor('#f8f9fa')
+        
+        self.temp_ax.plot(self.time_data, self.temperature_data, 
+                         'o-', linewidth=2, markersize=3, 
+                         label='Temperature', color='#e74c3c')
+        self.temp_ax.legend()
+        
+        if len(self.time_data) > 1:
+            time_range = max(self.time_data) - min(self.time_data)
+            padding = max(time_range * 0.05, 1)
+            self.temp_ax.set_xlim(min(self.time_data) - padding, 
+                                 max(self.time_data) + padding)
+        
+        self.temp_figure.tight_layout(pad=3.0)
+        self.temp_canvas.draw()
+    
+    def update_humidity_plot(self):
+        """Update humidity plot"""
+        self.humidity_ax.clear()
+        self.humidity_ax.set_title('Humidity vs Time', fontsize=14, fontweight='bold', pad=20)
+        self.humidity_ax.set_xlabel('Time (seconds since start)', fontsize=12)
+        self.humidity_ax.set_ylabel('Humidity (%)', fontsize=12)
+        self.humidity_ax.grid(True, alpha=0.3)
+        self.humidity_ax.set_facecolor('#f8f9fa')
+        
+        self.humidity_ax.plot(self.time_data, self.humidity_data, 
+                             '^-', linewidth=2, markersize=3, 
+                             label='Humidity', color='#3498db')
+        self.humidity_ax.legend()
+        
+        if len(self.time_data) > 1:
+            time_range = max(self.time_data) - min(self.time_data)
+            padding = max(time_range * 0.05, 1)
+            self.humidity_ax.set_xlim(min(self.time_data) - padding, 
+                                     max(self.time_data) + padding)
+        
+        self.humidity_figure.tight_layout(pad=3.0)
+        self.humidity_canvas.draw()
+    
+    def update_pressure_plot(self):
+        """Update pressure plot"""
+        self.pressure_ax.clear()
+        self.pressure_ax.set_title('Pressure vs Time', fontsize=14, fontweight='bold', pad=20)
+        self.pressure_ax.set_xlabel('Time (seconds since start)', fontsize=12)
+        self.pressure_ax.set_ylabel('Pressure (hPa)', fontsize=12)
+        self.pressure_ax.grid(True, alpha=0.3)
+        self.pressure_ax.set_facecolor('#f8f9fa')
+        
+        self.pressure_ax.plot(self.time_data, self.pressure_data, 
+                             's-', linewidth=2, markersize=3, 
+                             label='Pressure', color='#f39c12')
+        self.pressure_ax.legend()
+        
+        if len(self.time_data) > 1:
+            time_range = max(self.time_data) - min(self.time_data)
+            padding = max(time_range * 0.05, 1)
+            self.pressure_ax.set_xlim(min(self.time_data) - padding, 
+                                     max(self.time_data) + padding)
+        
+        self.pressure_figure.tight_layout(pad=3.0)
+        self.pressure_canvas.draw()
+    
+    def update_overview_plot(self):
+        """Update overview plot with all sensors"""
+        # Clear all overview plots
+        self.overview_ax1.clear()
+        self.overview_ax2.clear()
+        self.overview_ax3.clear()
+        
+        # Reapply styling
+        self.overview_ax1.set_title('Temperature', fontsize=12, fontweight='bold')
+        self.overview_ax1.set_ylabel('Temperature (°C)', fontsize=10)
+        self.overview_ax1.grid(True, alpha=0.3)
+        self.overview_ax1.set_facecolor('#f8f9fa')
+        
+        self.overview_ax2.set_title('Humidity', fontsize=12, fontweight='bold')
+        self.overview_ax2.set_ylabel('Humidity (%)', fontsize=10)
+        self.overview_ax2.grid(True, alpha=0.3)
+        self.overview_ax2.set_facecolor('#f8f9fa')
+        
+        self.overview_ax3.set_title('Pressure', fontsize=12, fontweight='bold')
+        self.overview_ax3.set_xlabel('Time (seconds since start)', fontsize=10)
+        self.overview_ax3.set_ylabel('Pressure (hPa)', fontsize=10)
+        self.overview_ax3.grid(True, alpha=0.3)
+        self.overview_ax3.set_facecolor('#f8f9fa')
+        
+        # Plot data
+        self.overview_ax1.plot(self.time_data, self.temperature_data, 
+                              'o-', linewidth=1, markersize=2, 
+                              label='Temperature', color='#e74c3c')
+        self.overview_ax1.legend(fontsize=8)
+        
+        self.overview_ax2.plot(self.time_data, self.humidity_data, 
+                              '^-', linewidth=1, markersize=2, 
+                              label='Humidity', color='#3498db')
+        self.overview_ax2.legend(fontsize=8)
+        
+        self.overview_ax3.plot(self.time_data, self.pressure_data, 
+                              's-', linewidth=1, markersize=2, 
+                              label='Pressure', color='#f39c12')
+        self.overview_ax3.legend(fontsize=8)
+        
+        # Set axis limits
+        if len(self.time_data) > 1:
+            time_range = max(self.time_data) - min(self.time_data)
+            padding = max(time_range * 0.05, 1)
+            xlim = (min(self.time_data) - padding, max(self.time_data) + padding)
+            self.overview_ax1.set_xlim(xlim)
+            self.overview_ax2.set_xlim(xlim)
+            self.overview_ax3.set_xlim(xlim)
+        
+        self.overview_figure.tight_layout(pad=2.0)
+        self.overview_canvas.draw()
+    
+    def clear_all_plots(self):
+        """Clear all plots when no data is available"""
+        # Clear individual plots
+        self.temp_ax.clear()
+        self.humidity_ax.clear()
+        self.pressure_ax.clear()
+        
+        # Clear overview plots
+        self.overview_ax1.clear()
+        self.overview_ax2.clear()
+        self.overview_ax3.clear()
+        
+        # Reapply styling
+        self.setup_individual_plot_styling()
+        self.setup_overview_plot_styling()
     
     def closeEvent(self, event):
         """Handle application close event"""
