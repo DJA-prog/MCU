@@ -1,103 +1,193 @@
 #!/usr/bin/env python3
 """
 Real-time Sensor Data Plotting GUI using PyQt5
-Connects to the MQTT Sensor Data Recorder API and displays live plots
+Connects to ESP8266 via Serial and displays live plots
 """
 
 import sys
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                             QHBoxLayout, QGridLayout, QPushButton, QLabel, 
                             QLineEdit, QCheckBox, QGroupBox, QMessageBox,
-                            QSplitter, QFrame, QTabWidget)
+                            QSplitter, QFrame, QTabWidget, QComboBox)
 from PyQt5.QtCore import QTimer, QThread, pyqtSignal, Qt
 from PyQt5.QtGui import QFont, QPalette, QColor
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
-import requests
+import serial
+import serial.tools.list_ports
 import json
 from datetime import datetime, timedelta
 import threading
 import queue
 import numpy as np
+import time
 
-class DataWorker(QThread):
-    """Worker thread for fetching data from API"""
-    data_received = pyqtSignal(list)
+class SerialWorker(QThread):
+    """Worker thread for serial communication with ESP8266"""
+    data_received = pyqtSignal(dict)
     status_received = pyqtSignal(dict)
     error_occurred = pyqtSignal(str)
     
-    def __init__(self, api_base):
+    def __init__(self, port, baudrate=115200):
         super().__init__()
-        self.api_base = api_base
+        self.port = port
+        self.baudrate = baudrate
         self.running = True
+        self.serial_connection = None
+        self.data_buffer = []
         
-    def api_call(self, endpoint, method='GET'):
-        """Make API call with error handling"""
+    def connect_serial(self):
+        """Connect to serial port"""
         try:
-            url = f"{self.api_base}{endpoint}"
-            if method == 'GET':
-                response = requests.get(url, timeout=5)
-            elif method == 'POST':
-                response = requests.post(url, timeout=5)
-            
-            response.raise_for_status()
-            return response.json()
-        except requests.exceptions.RequestException as e:
-            return {"status": "error", "message": str(e)}
-        except json.JSONDecodeError as e:
-            return {"status": "error", "message": "Invalid JSON response"}
+            if self.serial_connection and self.serial_connection.is_open:
+                self.serial_connection.close()
+                
+            self.serial_connection = serial.Serial(
+                port=self.port,
+                baudrate=self.baudrate,
+                timeout=1,
+                write_timeout=1
+            )
+            time.sleep(2)  # Give time for connection to establish
+            return True
+        except Exception as e:
+            self.error_occurred.emit(f"Failed to connect to {self.port}: {str(e)}")
+            return False
     
-    def fetch_status(self):
-        """Fetch status from API"""
-        result = self.api_call('/status')
-        if result.get('status') == 'success':
-            self.status_received.emit(result['data'])
-        else:
-            self.error_occurred.emit(result.get('message', 'Unknown error'))
-    
-    def fetch_data(self):
-        """Fetch data from API"""
-        result = self.api_call('/data?limit=500')
-        if result.get('status') == 'success':
-            self.data_received.emit(result['data'])
-        else:
-            self.error_occurred.emit(result.get('message', 'Unknown error'))
-    
-    def start_recording(self):
-        """Start recording"""
-        result = self.api_call('/start', 'POST')
-        return result
-    
-    def stop_recording(self):
-        """Stop recording"""
-        result = self.api_call('/stop', 'POST')
-        return result
+    def send_at_command(self, command):
+        """Send AT command to ESP8266"""
+        try:
+            if not self.serial_connection or not self.serial_connection.is_open:
+                if not self.connect_serial():
+                    return False
+                    
+            command_line = f"{command}\n"
+            self.serial_connection.write(command_line.encode())
+            self.serial_connection.flush()
+            return True
+        except Exception as e:
+            self.error_occurred.emit(f"Failed to send command: {str(e)}")
+            return False
     
     def cooler_on(self):
         """Turn cooler ON"""
-        result = self.api_call('/cooler/on', 'POST')
-        return result
+        return self.send_at_command("AT+COOLER=ON")
     
     def cooler_off(self):
         """Turn cooler OFF"""
-        result = self.api_call('/cooler/off', 'POST')
-        return result
+        return self.send_at_command("AT+COOLER=OFF")
     
     def cooler_auto(self):
         """Set cooler to automatic mode"""
-        result = self.api_call('/cooler/auto', 'POST')
-        return result
+        return self.send_at_command("AT+COOLER=AUTO")
+    
+    def get_status(self):
+        """Get device status"""
+        return self.send_at_command("AT+STATUS")
+    
+    def get_data(self):
+        """Get current sensor data"""
+        return self.send_at_command("AT+DATA")
+    
+    def set_start_temp(self, temp):
+        """Set start temperature threshold"""
+        return self.send_at_command(f"AT+SETSTART={temp}")
+    
+    def set_stop_temp(self, temp):
+        """Set stop temperature threshold"""
+        return self.send_at_command(f"AT+SETSTOP={temp}")
+    
+    def get_thresholds(self):
+        """Get current temperature thresholds"""
+        return self.send_at_command("AT+GETTHRESH")
+    
+    def run(self):
+        """Main thread loop for reading serial data"""
+        while self.running:
+            try:
+                if not self.serial_connection or not self.serial_connection.is_open:
+                    if not self.connect_serial():
+                        time.sleep(5)  # Wait before retrying
+                        continue
+                
+                if self.serial_connection.in_waiting > 0:
+                    line = self.serial_connection.readline().decode('utf-8', errors='ignore').strip()
+                    
+                    if line:
+                        self.process_serial_line(line)
+                        
+                time.sleep(0.1)  # Small delay to prevent high CPU usage
+                
+            except Exception as e:
+                self.error_occurred.emit(f"Serial communication error: {str(e)}")
+                time.sleep(1)
+    
+    def process_serial_line(self, line):
+        """Process a line received from serial"""
+        try:
+            # Try to parse as JSON (sensor data)
+            if line.startswith('{') and line.endswith('}'):
+                data = json.loads(line)
+                if 'temperature' in data:
+                    # Add to data buffer for plotting
+                    data['timestamp_received'] = datetime.now().isoformat()
+                    self.data_buffer.append(data)
+                    
+                    # Keep only last 500 readings
+                    if len(self.data_buffer) > 500:
+                        self.data_buffer = self.data_buffer[-500:]
+                    
+                    # Emit the latest data
+                    self.data_received.emit(data)
+                    
+            # Handle status messages
+            elif line.startswith('STATUS:'):
+                # Parse status information
+                status_info = line[7:].strip()  # Remove "STATUS: " prefix
+                
+                # Create a status dictionary from the message
+                status = {
+                    'message': status_info,
+                    'timestamp': datetime.now().isoformat()
+                }
+                self.status_received.emit(status)
+                
+            # Handle OK/ERROR responses
+            elif line in ['OK', 'ERROR']:
+                print(f"Command response: {line}")
+                
+        except json.JSONDecodeError:
+            # Not JSON, might be status message or other output
+            if line.startswith('ERROR:'):
+                self.error_occurred.emit(line[6:].strip())
+            else:
+                print(f"Serial: {line}")
+        except Exception as e:
+            print(f"Error processing serial line: {e}")
+    
+    def get_buffered_data(self):
+        """Get all buffered data for plotting"""
+        return self.data_buffer.copy()
+    
+    def stop(self):
+        """Stop the serial worker"""
+        self.running = False
+        if self.serial_connection and self.serial_connection.is_open:
+            self.serial_connection.close()
 
 class SensorPlotGUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Sensor Data Plotter - Qt5")
-        self.setGeometry(100, 100, 1400, 900)
+        self.setWindowTitle("Sensor Data Plotter - Serial Interface")
+        # Optimized for 1366x768 screen - leave some margin for taskbar/panels
+        self.setGeometry(50, 50, 1280, 680)
+        self.setMinimumSize(1000, 600)
         
-        # API configuration
-        self.api_base = "http://localhost:5002/api"
+        # Serial configuration
+        self.serial_port = "/dev/ttyUSB0"  # Default port
+        self.baudrate = 115200
         
         # Data storage
         self.time_data = []
@@ -112,7 +202,7 @@ class SensorPlotGUI(QMainWindow):
         self.auto_refresh = True
         
         # Setup worker thread
-        self.worker = DataWorker(self.api_base)
+        self.worker = SerialWorker(self.serial_port, self.baudrate)
         self.worker.data_received.connect(self.process_new_data)
         self.worker.status_received.connect(self.update_status_display)
         self.worker.error_occurred.connect(self.show_error)
@@ -130,10 +220,10 @@ class SensorPlotGUI(QMainWindow):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         
-        # Main layout
+        # Main layout - compact for 1366x768 screen
         main_layout = QVBoxLayout(central_widget)
-        main_layout.setSpacing(10)
-        main_layout.setContentsMargins(10, 10, 10, 10)
+        main_layout.setSpacing(5)  # Reduced spacing
+        main_layout.setContentsMargins(5, 5, 5, 5)  # Reduced margins
         
         # Create control panel
         self.create_control_panel(main_layout)
@@ -154,22 +244,22 @@ class SensorPlotGUI(QMainWindow):
         
         self.start_btn = QPushButton("Start Recording")
         self.start_btn.clicked.connect(self.start_recording)
-        self.start_btn.setMinimumHeight(35)
+        self.start_btn.setMinimumHeight(28)  # Reduced height
         button_layout.addWidget(self.start_btn)
         
         self.stop_btn = QPushButton("Stop Recording")
         self.stop_btn.clicked.connect(self.stop_recording)
-        self.stop_btn.setMinimumHeight(35)
+        self.stop_btn.setMinimumHeight(28)  # Reduced height
         button_layout.addWidget(self.stop_btn)
         
         self.refresh_btn = QPushButton("Refresh Data")
         self.refresh_btn.clicked.connect(self.manual_refresh)
-        self.refresh_btn.setMinimumHeight(35)
+        self.refresh_btn.setMinimumHeight(28)  # Reduced height
         button_layout.addWidget(self.refresh_btn)
         
         self.clear_btn = QPushButton("Clear Plot")
         self.clear_btn.clicked.connect(self.clear_data)
-        self.clear_btn.setMinimumHeight(35)
+        self.clear_btn.setMinimumHeight(28)  # Reduced height
         button_layout.addWidget(self.clear_btn)
         
         # Add separator
@@ -178,19 +268,19 @@ class SensorPlotGUI(QMainWindow):
         # Cooler control buttons
         self.cooler_on_btn = QPushButton("Cooler ON")
         self.cooler_on_btn.clicked.connect(self.turn_cooler_on)
-        self.cooler_on_btn.setMinimumHeight(35)
+        self.cooler_on_btn.setMinimumHeight(28)  # Reduced height
         self.cooler_on_btn.setStyleSheet("background-color: #28a745;")
         button_layout.addWidget(self.cooler_on_btn)
         
         self.cooler_off_btn = QPushButton("Cooler OFF")
         self.cooler_off_btn.clicked.connect(self.turn_cooler_off)
-        self.cooler_off_btn.setMinimumHeight(35)
+        self.cooler_off_btn.setMinimumHeight(28)  # Reduced height
         self.cooler_off_btn.setStyleSheet("background-color: #dc3545;")
         button_layout.addWidget(self.cooler_off_btn)
         
         self.cooler_auto_btn = QPushButton("Auto Mode")
         self.cooler_auto_btn.clicked.connect(self.set_cooler_auto)
-        self.cooler_auto_btn.setMinimumHeight(35)
+        self.cooler_auto_btn.setMinimumHeight(28)  # Reduced height
         self.cooler_auto_btn.setStyleSheet("background-color: #ffc107; color: black;")
         button_layout.addWidget(self.cooler_auto_btn)
         
@@ -204,13 +294,19 @@ class SensorPlotGUI(QMainWindow):
         self.auto_refresh_cb.stateChanged.connect(self.toggle_auto_refresh)
         settings_layout.addWidget(self.auto_refresh_cb)
         
-        settings_layout.addWidget(QLabel("API:"))
-        self.api_entry = QLineEdit(self.api_base)
-        self.api_entry.setMinimumWidth(250)
-        settings_layout.addWidget(self.api_entry)
+        settings_layout.addWidget(QLabel("Serial Port:"))
+        self.port_entry = QLineEdit(self.serial_port)
+        self.port_entry.setMinimumWidth(150)
+        settings_layout.addWidget(self.port_entry)
         
-        connect_btn = QPushButton("Connect")
-        connect_btn.clicked.connect(self.update_api_base)
+        settings_layout.addWidget(QLabel("Baudrate:"))
+        self.baudrate_entry = QLineEdit(str(self.baudrate))
+        self.baudrate_entry.setMinimumWidth(100)
+        settings_layout.addWidget(self.baudrate_entry)
+        
+        connect_btn = QPushButton("Reconnect")
+        connect_btn.clicked.connect(self.reconnect_serial)
+        connect_btn.clicked.connect(self.reconnect_serial)
         connect_btn.setMinimumHeight(30)
         settings_layout.addWidget(connect_btn)
         
@@ -290,8 +386,8 @@ class SensorPlotGUI(QMainWindow):
         temp_widget = QWidget()
         temp_layout = QVBoxLayout(temp_widget)
         
-        # Create matplotlib figure for temperature
-        self.temp_figure = Figure(figsize=(12, 6), facecolor='white')
+        # Create matplotlib figure for temperature - optimized for 1366x768
+        self.temp_figure = Figure(figsize=(10, 4.5), facecolor='white')
         self.temp_canvas = FigureCanvas(self.temp_figure)
         self.temp_ax = self.temp_figure.add_subplot(111)
         
@@ -308,8 +404,8 @@ class SensorPlotGUI(QMainWindow):
         humidity_widget = QWidget()
         humidity_layout = QVBoxLayout(humidity_widget)
         
-        # Create matplotlib figure for humidity
-        self.humidity_figure = Figure(figsize=(12, 6), facecolor='white')
+        # Create matplotlib figure for humidity - optimized for 1366x768
+        self.humidity_figure = Figure(figsize=(10, 4.5), facecolor='white')
         self.humidity_canvas = FigureCanvas(self.humidity_figure)
         self.humidity_ax = self.humidity_figure.add_subplot(111)
         
@@ -326,8 +422,8 @@ class SensorPlotGUI(QMainWindow):
         pressure_widget = QWidget()
         pressure_layout = QVBoxLayout(pressure_widget)
         
-        # Create matplotlib figure for pressure
-        self.pressure_figure = Figure(figsize=(12, 6), facecolor='white')
+        # Create matplotlib figure for pressure - optimized for 1366x768
+        self.pressure_figure = Figure(figsize=(10, 4.5), facecolor='white')
         self.pressure_canvas = FigureCanvas(self.pressure_figure)
         self.pressure_ax = self.pressure_figure.add_subplot(111)
         
@@ -344,14 +440,17 @@ class SensorPlotGUI(QMainWindow):
         overview_widget = QWidget()
         overview_layout = QVBoxLayout(overview_widget)
         
-        # Create matplotlib figure for overview
-        self.overview_figure = Figure(figsize=(12, 8), facecolor='white')
+        # Create matplotlib figure for overview - optimized for 1366x768
+        self.overview_figure = Figure(figsize=(10, 5.5), facecolor='white')
         self.overview_canvas = FigureCanvas(self.overview_figure)
         
-        # Create subplots for overview
+        # Create subplots for overview - more compact spacing
         self.overview_ax1 = self.overview_figure.add_subplot(311)
         self.overview_ax2 = self.overview_figure.add_subplot(312)
         self.overview_ax3 = self.overview_figure.add_subplot(313)
+        
+        # Adjust subplot spacing for compact layout
+        self.overview_figure.subplots_adjust(hspace=0.4)
         
         # Add navigation toolbar
         overview_toolbar = NavigationToolbar(self.overview_canvas, overview_widget)
@@ -475,64 +574,33 @@ class SensorPlotGUI(QMainWindow):
         """)
         
     def setup_timers(self):
-        """Setup Qt timers for periodic updates"""
-        # Status update timer
+        """Setup Qt timers for periodic updates and start serial worker"""
+        # Start the serial worker thread
+        self.worker.start()
+        
+        # Status update timer (less frequent since data comes automatically)
         self.status_timer = QTimer()
         self.status_timer.timeout.connect(self.update_status)
-        self.status_timer.start(3000)  # Every 3 seconds
+        self.status_timer.start(5000)  # Every 5 seconds
         
-        # Data update timer
-        self.data_timer = QTimer()
-        self.data_timer.timeout.connect(self.fetch_data)
-        self.data_timer.start(2000)  # Every 2 seconds
-        
-        # Initial update
+        # Initial status update
         self.update_status()
-        self.fetch_data()
-        # Initial update
-        self.update_status()
-        self.fetch_data()
         
     def toggle_auto_refresh(self, state):
         """Toggle auto refresh functionality"""
         self.auto_refresh = state == Qt.Checked
-        if self.auto_refresh:
-            self.data_timer.start(2000)
-        else:
-            self.data_timer.stop()
         
     def start_recording(self):
-        """Start MQTT recording via API"""
-        def start_async():
-            try:
-                result = self.worker.start_recording()
-                if result.get('status') == 'success':
-                    # Use Qt's signal mechanism to show message box in main thread
-                    self.show_success_message("Recording started!")
-                    # Update status after 2 seconds
-                    QTimer.singleShot(2000, self.update_status)
-                else:
-                    message = result.get('message', 'Unknown error')
-                    self.show_error_message(f"Failed to start: {message}")
-            except Exception as e:
-                self.show_error_message(f"Error starting recording: {str(e)}")
-        
-        # Run in separate thread to avoid blocking UI
-        threading.Thread(target=start_async, daemon=True).start()
+        """Start data recording (always recording with serial)"""
+        self.is_recording = True
+        self.start_time = datetime.now()
+        self.clear_data()
+        self.show_success_message("Started data recording!")
         
     def stop_recording(self):
-        """Stop MQTT recording via API"""
-        def stop_async():
-            try:
-                result = self.worker.stop_recording()
-                if result.get('status') == 'success':
-                    self.show_success_message("Recording stopped!")
-                    self.update_status()
-                else:
-                    message = result.get('message', 'Unknown error')
-                    self.show_error_message(f"Failed to stop: {message}")
-            except Exception as e:
-                self.show_error_message(f"Error stopping recording: {str(e)}")
+        """Stop data recording"""
+        self.is_recording = False
+        self.show_success_message("Stopped data recording!")
         
         # Run in separate thread to avoid blocking UI
         threading.Thread(target=stop_async, daemon=True).start()
@@ -546,61 +614,51 @@ class SensorPlotGUI(QMainWindow):
         print(f"Error: {message}")
     
     def turn_cooler_on(self):
-        """Turn cooler ON via API"""
-        def cooler_on_async():
-            try:
-                result = self.worker.cooler_on()
-                if result.get('status') == 'success':
-                    self.show_success_message("Cooler turned ON!")
-                else:
-                    message = result.get('message', 'Unknown error')
-                    self.show_error_message(f"Failed to turn cooler ON: {message}")
-            except Exception as e:
-                self.show_error_message(f"Error controlling cooler: {str(e)}")
-        
-        threading.Thread(target=cooler_on_async, daemon=True).start()
+        """Turn cooler ON via serial command"""
+        if self.worker.cooler_on():
+            self.show_success_message("Cooler ON command sent!")
+        else:
+            self.show_error_message("Failed to send cooler ON command")
     
     def turn_cooler_off(self):
-        """Turn cooler OFF via API"""
-        def cooler_off_async():
-            try:
-                result = self.worker.cooler_off()
-                if result.get('status') == 'success':
-                    self.show_success_message("Cooler turned OFF!")
-                else:
-                    message = result.get('message', 'Unknown error')
-                    self.show_error_message(f"Failed to turn cooler OFF: {message}")
-            except Exception as e:
-                self.show_error_message(f"Error controlling cooler: {str(e)}")
-        
-        threading.Thread(target=cooler_off_async, daemon=True).start()
+        """Turn cooler OFF via serial command"""
+        if self.worker.cooler_off():
+            self.show_success_message("Cooler OFF command sent!")
+        else:
+            self.show_error_message("Failed to send cooler OFF command")
     
     def set_cooler_auto(self):
-        """Set cooler to automatic mode via API"""
-        def cooler_auto_async():
-            try:
-                result = self.worker.cooler_auto()
-                if result.get('status') == 'success':
-                    self.show_success_message("Cooler set to automatic mode!")
-                else:
-                    message = result.get('message', 'Unknown error')
-                    self.show_error_message(f"Failed to set cooler to auto: {message}")
-            except Exception as e:
-                self.show_error_message(f"Error controlling cooler: {str(e)}")
+        """Set cooler to automatic mode via serial command"""
+        if self.worker.cooler_auto():
+            self.show_success_message("Cooler set to automatic mode!")
+        else:
+            self.show_error_message("Failed to set cooler to auto mode")
         
-        threading.Thread(target=cooler_auto_async, daemon=True).start()
+    def reconnect_serial(self):
+        """Reconnect with new serial settings"""
+        new_port = self.port_entry.text().strip()
+        new_baudrate = int(self.baudrate_entry.text().strip())
         
-    def update_api_base(self):
-        """Update API base URL"""
-        new_api = self.api_entry.text().strip()
-        if new_api:
-            self.api_base = new_api
-            self.worker.api_base = new_api
-            self.update_status()
+        # Stop current worker
+        self.worker.stop()
+        self.worker.wait()
+        
+        # Update settings
+        self.serial_port = new_port
+        self.baudrate = new_baudrate
+        
+        # Create new worker
+        self.worker = SerialWorker(self.serial_port, self.baudrate)
+        self.worker.data_received.connect(self.process_new_data)
+        self.worker.status_received.connect(self.update_status_display)
+        self.worker.error_occurred.connect(self.show_error)
+        self.worker.start()
+        
+        self.show_success_message(f"Reconnected to {new_port} at {new_baudrate} baud")
             
     def manual_refresh(self):
         """Manually refresh data"""
-        self.fetch_data()
+        self.refresh_plots()
         
     def clear_data(self):
         """Clear all plotted data"""
@@ -613,12 +671,12 @@ class SensorPlotGUI(QMainWindow):
         
     def update_status(self):
         """Update connection and recording status"""
-        self.worker.fetch_status()
+        self.worker.get_status()
         
     def fetch_data(self):
-        """Fetch data from API"""
+        """Fetch data from serial"""
         if self.auto_refresh:
-            self.worker.fetch_data()
+            self.worker.get_data()
         
     def update_status_display(self, status_data):
         """Update status labels with current data"""
@@ -683,59 +741,43 @@ class SensorPlotGUI(QMainWindow):
         self.humidity_label.setText("Humidity: -- %")
         self.cooler_status_label.setText("Cooler: --")
         
-    def process_new_data(self, readings):
-        """Process new data and update plots"""
-        if not readings:
+    def process_new_data(self, reading):
+        """Process new data from serial communication"""
+        if not reading:
             return
             
-        # Clear existing data
-        self.time_data.clear()
-        self.temperature_data.clear()
-        self.humidity_data.clear()
-        self.pressure_data.clear()
-        
-        # Set start time from first reading
-        if readings:
-            try:
-                first_timestamp = readings[0]['timestamp_received']
-                if isinstance(first_timestamp, (int, float)):
-                    # If timestamp is a number, treat it as Unix timestamp
-                    self.start_time = datetime.fromtimestamp(first_timestamp)
-                else:
-                    # If timestamp is a string, parse it
-                    self.start_time = datetime.fromisoformat(str(first_timestamp).replace('Z', '+00:00'))
-            except (ValueError, KeyError, TypeError):
+        try:
+            # Set start time from first reading if not set
+            if self.start_time is None:
                 self.start_time = datetime.now()
-        
-        # Process all readings
-        for reading in readings:
-            try:
-                timestamp_val = reading['timestamp_received']
-                
-                if isinstance(timestamp_val, (int, float)):
-                    # If timestamp is a number, treat it as Unix timestamp
-                    timestamp = datetime.fromtimestamp(timestamp_val)
-                else:
-                    # If timestamp is a string, parse it
-                    timestamp = datetime.fromisoformat(str(timestamp_val).replace('Z', '+00:00'))
-                
-                seconds_since_start = (timestamp - self.start_time).total_seconds()
-                
-                temperature = float(reading.get('temperature', 0))
-                humidity = float(reading.get('humidity', 0))
-                pressure = float(reading.get('pressure', 0))
-                
-                self.time_data.append(seconds_since_start)
-                self.temperature_data.append(temperature)
-                self.humidity_data.append(humidity)
-                self.pressure_data.append(pressure)
-                
-            except (ValueError, TypeError, KeyError) as e:
-                print(f"Error processing reading: {e}")
-                continue
-        
-        # Update plots
-        self.update_plots()
+            
+            # Get timestamp - use current time since serial data is real-time
+            timestamp = datetime.now()
+            seconds_since_start = (timestamp - self.start_time).total_seconds()
+            
+            temperature = float(reading.get('temperature', 0))
+            humidity = float(reading.get('humidity', 0))
+            pressure = float(reading.get('pressure', 0))
+            
+            # Add to data lists
+            self.time_data.append(seconds_since_start)
+            self.temperature_data.append(temperature)
+            self.humidity_data.append(humidity)
+            self.pressure_data.append(pressure)
+            
+            # Keep only recent data (last 500 points)
+            max_points = 500
+            if len(self.time_data) > max_points:
+                self.time_data = self.time_data[-max_points:]
+                self.temperature_data = self.temperature_data[-max_points:]
+                self.humidity_data = self.humidity_data[-max_points:]
+                self.pressure_data = self.pressure_data[-max_points:]
+            
+            # Update plots
+            self.update_plots()
+            
+        except (ValueError, KeyError, TypeError) as e:
+            print(f"Error processing data: {e}")
         
     def update_plots(self):
         """Update matplotlib plots with current data"""
@@ -757,6 +799,33 @@ class SensorPlotGUI(QMainWindow):
         except Exception as e:
             print(f"Error updating plots: {e}")
     
+    def refresh_plots(self):
+        """Refresh plots with current buffered data"""
+        try:
+            buffered_data = self.worker.get_buffered_data()
+            if buffered_data:
+                # Process the buffered data to rebuild plot data
+                self.time_data.clear()
+                self.temperature_data.clear()
+                self.humidity_data.clear()
+                self.pressure_data.clear()
+                
+                if self.start_time is None:
+                    self.start_time = datetime.now()
+                
+                for data_point in buffered_data:
+                    timestamp = datetime.now()  # Use current time for simplicity
+                    seconds_since_start = (timestamp - self.start_time).total_seconds()
+                    
+                    self.time_data.append(seconds_since_start)
+                    self.temperature_data.append(float(data_point.get('temperature', 0)))
+                    self.humidity_data.append(float(data_point.get('humidity', 0)))
+                    self.pressure_data.append(float(data_point.get('pressure', 0)))
+                
+                self.update_plots()
+        except Exception as e:
+            print(f"Error refreshing plots: {e}")
+    
     def update_temperature_plot(self):
         """Update temperature plot"""
         self.temp_ax.clear()
@@ -777,7 +846,7 @@ class SensorPlotGUI(QMainWindow):
             self.temp_ax.set_xlim(min(self.time_data) - padding, 
                                  max(self.time_data) + padding)
         
-        self.temp_figure.tight_layout(pad=3.0)
+        self.temp_figure.tight_layout(pad=1.5)  # Reduced padding for 1366x768
         self.temp_canvas.draw()
     
     def update_humidity_plot(self):
@@ -800,7 +869,7 @@ class SensorPlotGUI(QMainWindow):
             self.humidity_ax.set_xlim(min(self.time_data) - padding, 
                                      max(self.time_data) + padding)
         
-        self.humidity_figure.tight_layout(pad=3.0)
+        self.humidity_figure.tight_layout(pad=1.5)  # Reduced padding for 1366x768
         self.humidity_canvas.draw()
     
     def update_pressure_plot(self):
@@ -823,7 +892,7 @@ class SensorPlotGUI(QMainWindow):
             self.pressure_ax.set_xlim(min(self.time_data) - padding, 
                                      max(self.time_data) + padding)
         
-        self.pressure_figure.tight_layout(pad=3.0)
+        self.pressure_figure.tight_layout(pad=1.5)  # Reduced padding for 1366x768
         self.pressure_canvas.draw()
     
     def update_overview_plot(self):
@@ -875,7 +944,7 @@ class SensorPlotGUI(QMainWindow):
             self.overview_ax2.set_xlim(xlim)
             self.overview_ax3.set_xlim(xlim)
         
-        self.overview_figure.tight_layout(pad=2.0)
+        self.overview_figure.tight_layout(pad=1.0)  # Reduced padding for 1366x768
         self.overview_canvas.draw()
     
     def clear_all_plots(self):
@@ -894,37 +963,44 @@ class SensorPlotGUI(QMainWindow):
         self.setup_individual_plot_styling()
         self.setup_overview_plot_styling()
     
-    def closeEvent(self, event):
+    def closeEvent(self, a0):
         """Handle application close event"""
-        # Stop timers
-        self.status_timer.stop()
-        self.data_timer.stop()
+        # Stop timers if they exist
+        if hasattr(self, 'status_timer'):
+            self.status_timer.stop()
         
         # Close worker thread
-        self.worker.running = False
-        self.worker.quit()
-        self.worker.wait()
+        if hasattr(self, 'worker'):
+            self.worker.stop()
+            self.worker.wait()
         
-        event.accept()
+        a0.accept()
 
 def main():
-    """Main function to run the Qt5 GUI"""
-    app = QApplication(sys.argv)
-    
-    # Set application properties
-    app.setApplicationName("Sensor Data Plotter")
-    app.setApplicationVersion("2.0")
-    app.setOrganizationName("IoT Sensor Systems")
-    
-    # Apply dark theme (optional)
-    # app.setStyle('Fusion')
-    
-    # Create and show main window
-    window = SensorPlotGUI()
-    window.show()
-    
-    # Start event loop
-    sys.exit(app.exec_())
+    """Main function to run the Qt5 GUI with error handling"""
+    try:
+        app = QApplication(sys.argv)
+        
+        # Set application properties
+        app.setApplicationName("Sensor Data Plotter")
+        app.setApplicationVersion("2.0")
+        app.setOrganizationName("IoT Sensor Systems")
+        
+        # Use Fusion style for better compatibility on 1366x768 screens
+        app.setStyle('Fusion')
+        
+        # Create and show main window
+        window = SensorPlotGUI()
+        window.show()
+        
+        # Start event loop
+        sys.exit(app.exec_())
+        
+    except Exception as e:
+        print(f"Error starting application: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()

@@ -2,10 +2,7 @@
 #include <Wire.h>
 #include <Adafruit_BME280.h>
 #include <LiquidCrystal_I2C.h>
-#include <ESP8266WiFi.h>
-#include <PubSubClient.h>
 #include <ArduinoJson.h>
-#include "secrets.h"
 
 // Create BME280 instance
 Adafruit_BME280 bme;
@@ -13,13 +10,9 @@ Adafruit_BME280 bme;
 // Create LCD instance (address 0x26, 20 columns, 4 rows)
 LiquidCrystal_I2C lcd(0x26, 20, 4);
 
-// WiFi and MQTT clients
-WiFiClient espClient;
-PubSubClient client(espClient);
-
 // Timing variables
-unsigned long lastMqttPublish = 0;
-const unsigned long MQTT_PUBLISH_INTERVAL = 5000; // 5 seconds
+unsigned long lastDataSend = 0;
+const unsigned long DATA_SEND_INTERVAL = 5000; // 5 seconds
 
 // Cooler control variables
 const int RELAY_PIN = 14; // GPIO14 for relay control
@@ -29,79 +22,32 @@ unsigned long coolerStartTime = 0;
 unsigned long coolerRunTime = 0;
 unsigned long totalElapsedTime = 0; // Total time since first cooler start
 bool coolerEverStarted = false; // Track if cooler has ever been started
-bool mqttConnectedOnce = false; // Track if MQTT has been connected at least once
-const float COOLER_START_TEMP = 25.0; // Start cooler at 25°C (adjust as needed)
-const float COOLER_STOP_TEMP = 3.5;   // Stop cooler at 3.5°C
+float COOLER_START_TEMP = 4.5; // Start cooler at 25°C (adjustable via AT commands)
+float COOLER_STOP_TEMP = 3.5;   // Stop cooler at 3.5°C (adjustable via AT commands)
 
-void setupWiFi() {
-  delay(10);
-  Serial.println();
-  Serial.print("Connecting to ");
-  Serial.println(WIFI_SSID);
-  
-  lcd.setCursor(0, 2);
-  lcd.print("Connecting WiFi...  ");
+// PID Controller variables
+float PID_Kp = 8.66;     // Proportional gain
+float PID_Ki = 0.0121;   // Integral gain
+float PID_Kd = 774.21;   // Derivative gain
+float PID_setpoint = 4.0; // Target temperature (adjustable via AT commands)
+bool PID_enabled = false; // PID control mode (false = simple on/off, true = PID)
 
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+// PID calculation variables
+float PID_error = 0;
+float PID_last_error = 0;
+float PID_integral = 0;
+float PID_derivative = 0;
+float PID_output = 0;
+unsigned long PID_last_time = 0;
+const unsigned long PID_SAMPLE_TIME = 1000; // PID calculation interval (1 second)
 
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
+// Serial command processing
+String inputString = "";
+bool stringComplete = false;
 
-  Serial.println("");
-  Serial.println("WiFi connected");
-  Serial.println("IP address: ");
-  Serial.println(WiFi.localIP());
-  
-  lcd.setCursor(0, 2);
-  lcd.print("WiFi Connected!     ");
-}
-
-void reconnectMQTT() {
-  while (!client.connected()) {
-    Serial.print("Attempting MQTT connection...");
-    lcd.setCursor(0, 3);
-    lcd.print("MQTT Connecting...  ");
-    
-    if (client.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASSWORD)) {
-      Serial.println("connected");
-      lcd.setCursor(0, 3);
-      lcd.print("MQTT Connected!     ");
-      
-      // Subscribe to control topic for remote cooler control
-      client.subscribe("sensors/cooler/control");
-      Serial.println("📡 Subscribed to sensors/cooler/control");
-      
-      // Turn on cooler after first MQTT connection
-      if (!mqttConnectedOnce) {
-        mqttConnectedOnce = true;
-        digitalWrite(RELAY_PIN, HIGH);  // Turn cooler ON
-        coolerRunning = true;
-        coolerStartTime = millis();
-        coolerEverStarted = true;
-        
-        Serial.println("🧊 Cooler STARTED after MQTT connection!");
-        
-        // Update LCD
-        lcd.setCursor(0, 3);
-        lcd.print("Cooler: ON          ");
-        delay(2000); // Show the message for 2 seconds
-      }
-    } else {
-      Serial.print("failed, rc=");
-      Serial.print(client.state());
-      Serial.println(" try again in 5 seconds");
-      lcd.setCursor(0, 3);
-      lcd.print("MQTT Failed!        ");
-      delay(5000);
-    }
-  }
-}
-
-void publishSensorData(float temperature, float humidity, float pressure) {
+void sendSensorData(float temperature, float humidity, float pressure) {
   // Create JSON payload
-  StaticJsonDocument<350> doc; // Increased size for additional data
+  StaticJsonDocument<500> doc; // Increased size for PID data
   doc["temperature"] = round(temperature * 10) / 10.0; // Round to 1 decimal
   doc["humidity"] = round(humidity * 10) / 10.0; // Round to 1 decimal
   doc["pressure"] = round(pressure * 10) / 10.0;
@@ -113,53 +59,144 @@ void publishSensorData(float temperature, float humidity, float pressure) {
   doc["cooler_ever_started"] = coolerEverStarted;
   doc["manual_override"] = manualOverride; // Add manual override status
   
-  char buffer[400];
+  // Add PID information
+  doc["pid_enabled"] = PID_enabled;
+  doc["pid_setpoint"] = PID_setpoint;
+  doc["pid_output"] = PID_output;
+  doc["pid_error"] = PID_error;
+  doc["pid_kp"] = PID_Kp;
+  doc["pid_ki"] = PID_Ki;
+  doc["pid_kd"] = PID_Kd;
+  
+  char buffer[600]; // Increased buffer size
   serializeJson(doc, buffer);
   
-  if (client.publish(MQTT_TOPIC, buffer)) {
-    Serial.println("Data published successfully");
-    Serial.println(buffer);
-  } else {
-    Serial.println("Failed to publish data");
+  Serial.println(buffer);
+}
+
+float calculatePID(float currentTemp) {
+  unsigned long now = millis();
+  
+  // Check if enough time has passed for PID calculation
+  if (now - PID_last_time >= PID_SAMPLE_TIME) {
+    // Calculate error
+    PID_error = PID_setpoint - currentTemp;
+    
+    // Calculate integral (with windup protection)
+    PID_integral += PID_error * (PID_SAMPLE_TIME / 1000.0);
+    if (PID_integral > 100) PID_integral = 100;  // Clamp integral
+    if (PID_integral < -100) PID_integral = -100;
+    
+    // Calculate derivative
+    PID_derivative = (PID_error - PID_last_error) / (PID_SAMPLE_TIME / 1000.0);
+    
+    // Calculate PID output
+    PID_output = (PID_Kp * PID_error) + (PID_Ki * PID_integral) + (PID_Kd * PID_derivative);
+    
+    // Store values for next iteration
+    PID_last_error = PID_error;
+    PID_last_time = now;
+    
+    // Clamp output to 0-100 range (percentage)
+    if (PID_output > 100) PID_output = 100;
+    if (PID_output < 0) PID_output = 0;
   }
+  
+  return PID_output;
 }
 
 void controlCooler(float temperature) {
-  // Check if cooler should start
-  if (!coolerRunning && temperature >= COOLER_START_TEMP) {
-    // Start the cooler
-    digitalWrite(RELAY_PIN, HIGH);  // Activate relay (HIGH = ON for your relay)
-    coolerRunning = true;
-    
-    // Set start time for first run or restart
-    if (!coolerEverStarted) {
-      coolerStartTime = millis();
-      coolerEverStarted = true;
+  // Skip automatic control if manual override is active
+  if (manualOverride) {
+    // Update timing information even in manual mode
+    if (coolerEverStarted) {
+      totalElapsedTime = millis() - coolerStartTime;
+      if (coolerRunning) {
+        coolerRunTime = totalElapsedTime;
+      }
     }
-    
-    Serial.println("🧊 Cooler STARTED!");
-    Serial.print("Start temperature: ");
-    Serial.print(temperature);
-    Serial.println("°C");
-    
-    // Update LCD
-    lcd.setCursor(0, 3);
-    lcd.print("Cooler: ON          ");
+    return;
   }
-  // Check if cooler should stop
-  else if (coolerRunning && temperature <= COOLER_STOP_TEMP) {
-    // Stop the cooler
-    digitalWrite(RELAY_PIN, LOW); // Deactivate relay (LOW = OFF for your relay)
-    coolerRunning = false;
+
+  if (PID_enabled) {
+    // PID Control Mode
+    float pidOutput = calculatePID(temperature);
     
-    Serial.println("🛑 Cooler STOPPED!");
-    Serial.print("Stop temperature: ");
-    Serial.print(temperature);
-    Serial.println("°C");
-    
-    // Update LCD
-    lcd.setCursor(0, 3);
-    lcd.print("Cooler: OFF         ");
+    // Convert PID output to on/off control (simple implementation)
+    // You could implement PWM here for true proportional control
+    if (pidOutput > 50.0) { // Threshold for turning cooler on
+      if (!coolerRunning) {
+        digitalWrite(RELAY_PIN, HIGH);
+        coolerRunning = true;
+        
+        if (!coolerEverStarted) {
+          coolerStartTime = millis();
+          coolerEverStarted = true;
+        }
+        
+        Serial.println("STATUS: PID Cooler STARTED!");
+        Serial.print("STATUS: PID Output: ");
+        Serial.print(pidOutput);
+        Serial.print("%, Target: ");
+        Serial.print(PID_setpoint);
+        Serial.print("°C, Current: ");
+        Serial.print(temperature);
+        Serial.println("°C");
+        
+        lcd.setCursor(0, 3);
+        lcd.print("PID: ON             ");
+      }
+    } else {
+      if (coolerRunning) {
+        digitalWrite(RELAY_PIN, LOW);
+        coolerRunning = false;
+        
+        Serial.println("STATUS: PID Cooler STOPPED!");
+        Serial.print("STATUS: PID Output: ");
+        Serial.print(pidOutput);
+        Serial.print("%, Target: ");
+        Serial.print(PID_setpoint);
+        Serial.print("°C, Current: ");
+        Serial.print(temperature);
+        Serial.println("°C");
+        
+        lcd.setCursor(0, 3);
+        lcd.print("PID: OFF            ");
+      }
+    }
+  } else {
+    // Traditional On/Off Control Mode
+    if (!coolerRunning && temperature >= COOLER_START_TEMP) {
+      // Start the cooler
+      digitalWrite(RELAY_PIN, HIGH);
+      coolerRunning = true;
+      
+      if (!coolerEverStarted) {
+        coolerStartTime = millis();
+        coolerEverStarted = true;
+      }
+      
+      Serial.println("STATUS: Cooler STARTED!");
+      Serial.print("STATUS: Start temperature: ");
+      Serial.print(temperature);
+      Serial.println("°C");
+      
+      lcd.setCursor(0, 3);
+      lcd.print("Cooler: ON          ");
+    }
+    else if (coolerRunning && temperature <= COOLER_STOP_TEMP) {
+      // Stop the cooler
+      digitalWrite(RELAY_PIN, LOW);
+      coolerRunning = false;
+      
+      Serial.println("STATUS: Cooler STOPPED!");
+      Serial.print("STATUS: Stop temperature: ");
+      Serial.print(temperature);
+      Serial.println("°C");
+      
+      lcd.setCursor(0, 3);
+      lcd.print("Cooler: OFF         ");
+    }
   }
   
   // Update runtime and total elapsed time
@@ -174,8 +211,260 @@ void controlCooler(float temperature) {
   }
 }
 
-void setup()
-{
+void manualCoolerControl(bool turnOn) {
+  manualOverride = true;
+  
+  if (turnOn && !coolerRunning) {
+    // Turn cooler ON manually
+    digitalWrite(RELAY_PIN, HIGH);
+    coolerRunning = true;
+    
+    if (!coolerEverStarted) {
+      coolerStartTime = millis();
+      coolerEverStarted = true;
+    }
+    
+    Serial.println("STATUS: Cooler turned ON manually!");
+    lcd.setCursor(0, 3);
+    lcd.print("Manual: ON          ");
+    
+  } else if (!turnOn && coolerRunning) {
+    // Turn cooler OFF manually
+    digitalWrite(RELAY_PIN, LOW);
+    coolerRunning = false;
+    
+    Serial.println("STATUS: Cooler turned OFF manually!");
+    lcd.setCursor(0, 3);
+    lcd.print("Manual: OFF         ");
+  }
+}
+
+void processSerialCommand(String command) {
+  command.trim();
+  command.toUpperCase();
+  
+  if (command.startsWith("AT+")) {
+    String cmd = command.substring(3);
+    
+    if (cmd == "HELP") {
+      Serial.println("OK");
+      Serial.println("Available AT Commands:");
+      Serial.println("AT+HELP - Show this help");
+      Serial.println("AT+STATUS - Show current status");
+      Serial.println("AT+COOLER=ON - Turn cooler ON manually");
+      Serial.println("AT+COOLER=OFF - Turn cooler OFF manually");
+      Serial.println("AT+COOLER=AUTO - Return to automatic mode");
+      Serial.println("AT+SETSTART=XX.X - Set start temperature (°C)");
+      Serial.println("AT+SETSTOP=XX.X - Set stop temperature (°C)");
+      Serial.println("AT+GETTHRESH - Get current thresholds");
+      Serial.println("AT+RESET - Reset cooler timing");
+      Serial.println("AT+DATA - Get current sensor data");
+      Serial.println("AT+PID=ON - Enable PID control mode");
+      Serial.println("AT+PID=OFF - Disable PID control mode");
+      Serial.println("AT+PIDSET=XX.X - Set PID setpoint temperature");
+      Serial.println("AT+PIDKP=XX.X - Set PID Kp parameter");
+      Serial.println("AT+PIDKI=XX.X - Set PID Ki parameter");
+      Serial.println("AT+PIDKD=XX.X - Set PID Kd parameter");
+      Serial.println("AT+PIDGET - Get all PID parameters");
+      Serial.println("AT+PIDRESET - Reset PID integral and derivative");
+      
+    } else if (cmd == "STATUS") {
+      Serial.println("OK");
+      Serial.print("STATUS: Device: ESP8266_BME280, Uptime: ");
+      Serial.print(millis() / 1000);
+      Serial.println("s");
+      Serial.print("STATUS: Cooler: ");
+      Serial.print(coolerRunning ? "ON" : "OFF");
+      Serial.print(", Mode: ");
+      Serial.print(manualOverride ? "MANUAL" : (PID_enabled ? "PID" : "AUTO"));
+      Serial.println();
+      if (PID_enabled) {
+        Serial.print("STATUS: PID Setpoint: ");
+        Serial.print(PID_setpoint);
+        Serial.print("°C, Output: ");
+        Serial.print(PID_output);
+        Serial.println("%");
+      }
+      if (coolerEverStarted) {
+        Serial.print("STATUS: Runtime: ");
+        Serial.print(coolerRunTime / 1000);
+        Serial.print("s, Elapsed: ");
+        Serial.print(totalElapsedTime / 1000);
+        Serial.println("s");
+      }
+      
+    } else if (cmd.startsWith("COOLER=")) {
+      String value = cmd.substring(7);
+      if (value == "ON") {
+        manualCoolerControl(true);
+        Serial.println("OK");
+        Serial.println("STATUS: Cooler turned ON manually");
+      } else if (value == "OFF") {
+        manualCoolerControl(false);
+        Serial.println("OK");
+        Serial.println("STATUS: Cooler turned OFF manually");
+      } else if (value == "AUTO") {
+        manualOverride = false;
+        Serial.println("OK");
+        Serial.println("STATUS: Cooler returned to automatic mode");
+      } else {
+        Serial.println("ERROR: Invalid cooler command. Use ON, OFF, or AUTO");
+      }
+      
+    } else if (cmd.startsWith("SETSTART=")) {
+      String value = cmd.substring(9);
+      float newTemp = value.toFloat();
+      if (newTemp > 0 && newTemp < 100) {
+        COOLER_START_TEMP = newTemp;
+        Serial.println("OK");
+        Serial.print("STATUS: Start temperature set to ");
+        Serial.print(COOLER_START_TEMP);
+        Serial.println("°C");
+      } else {
+        Serial.println("ERROR: Invalid temperature. Use 0-100°C");
+      }
+      
+    } else if (cmd.startsWith("SETSTOP=")) {
+      String value = cmd.substring(8);
+      float newTemp = value.toFloat();
+      if (newTemp >= -20 && newTemp < 50) {
+        COOLER_STOP_TEMP = newTemp;
+        Serial.println("OK");
+        Serial.print("STATUS: Stop temperature set to ");
+        Serial.print(COOLER_STOP_TEMP);
+        Serial.println("°C");
+      } else {
+        Serial.println("ERROR: Invalid temperature. Use -20 to 50°C");
+      }
+      
+    } else if (cmd == "GETTHRESH") {
+      Serial.println("OK");
+      Serial.print("STATUS: Start temperature: ");
+      Serial.print(COOLER_START_TEMP);
+      Serial.println("°C");
+      Serial.print("STATUS: Stop temperature: ");
+      Serial.print(COOLER_STOP_TEMP);
+      Serial.println("°C");
+      
+    } else if (cmd == "RESET") {
+      coolerRunning = false;
+      manualOverride = false;
+      coolerStartTime = 0;
+      coolerRunTime = 0;
+      totalElapsedTime = 0;
+      coolerEverStarted = false;
+      digitalWrite(RELAY_PIN, LOW);
+      Serial.println("OK");
+      Serial.println("STATUS: Cooler system reset");
+      
+    } else if (cmd == "DATA") {
+      float temperature = bme.readTemperature();
+      float humidity = bme.readHumidity();
+      float pressure = bme.readPressure() / 100.0F;
+      Serial.println("OK");
+      sendSensorData(temperature, humidity, pressure);
+      
+    } else if (cmd.startsWith("PID=")) {
+      String value = cmd.substring(4);
+      if (value == "ON") {
+        PID_enabled = true;
+        manualOverride = false; // Disable manual override when PID is enabled
+        Serial.println("OK");
+        Serial.println("STATUS: PID control mode ENABLED");
+      } else if (value == "OFF") {
+        PID_enabled = false;
+        Serial.println("OK");
+        Serial.println("STATUS: PID control mode DISABLED");
+      } else {
+        Serial.println("ERROR: Invalid PID command. Use ON or OFF");
+      }
+      
+    } else if (cmd.startsWith("PIDSET=")) {
+      String value = cmd.substring(7);
+      float newSetpoint = value.toFloat();
+      if (newSetpoint >= -50 && newSetpoint <= 100) {
+        PID_setpoint = newSetpoint;
+        Serial.println("OK");
+        Serial.print("STATUS: PID setpoint set to ");
+        Serial.print(PID_setpoint);
+        Serial.println("°C");
+      } else {
+        Serial.println("ERROR: Invalid setpoint. Use -50 to 100°C");
+      }
+      
+    } else if (cmd.startsWith("PIDKP=")) {
+      String value = cmd.substring(6);
+      float newKp = value.toFloat();
+      if (newKp >= 0 && newKp <= 1000) {
+        PID_Kp = newKp;
+        Serial.println("OK");
+        Serial.print("STATUS: PID Kp set to ");
+        Serial.println(PID_Kp);
+      } else {
+        Serial.println("ERROR: Invalid Kp value. Use 0-1000");
+      }
+      
+    } else if (cmd.startsWith("PIDKI=")) {
+      String value = cmd.substring(6);
+      float newKi = value.toFloat();
+      if (newKi >= 0 && newKi <= 100) {
+        PID_Ki = newKi;
+        Serial.println("OK");
+        Serial.print("STATUS: PID Ki set to ");
+        Serial.println(PID_Ki);
+      } else {
+        Serial.println("ERROR: Invalid Ki value. Use 0-100");
+      }
+      
+    } else if (cmd.startsWith("PIDKD=")) {
+      String value = cmd.substring(6);
+      float newKd = value.toFloat();
+      if (newKd >= 0 && newKd <= 10000) {
+        PID_Kd = newKd;
+        Serial.println("OK");
+        Serial.print("STATUS: PID Kd set to ");
+        Serial.println(PID_Kd);
+      } else {
+        Serial.println("ERROR: Invalid Kd value. Use 0-10000");
+      }
+      
+    } else if (cmd == "PIDGET") {
+      Serial.println("OK");
+      Serial.print("STATUS: PID Enabled: ");
+      Serial.println(PID_enabled ? "YES" : "NO");
+      Serial.print("STATUS: PID Setpoint: ");
+      Serial.print(PID_setpoint);
+      Serial.println("°C");
+      Serial.print("STATUS: PID Kp: ");
+      Serial.println(PID_Kp);
+      Serial.print("STATUS: PID Ki: ");
+      Serial.println(PID_Ki);
+      Serial.print("STATUS: PID Kd: ");
+      Serial.println(PID_Kd);
+      Serial.print("STATUS: PID Output: ");
+      Serial.print(PID_output);
+      Serial.println("%");
+      Serial.print("STATUS: PID Error: ");
+      Serial.print(PID_error);
+      Serial.println("°C");
+      
+    } else if (cmd == "PIDRESET") {
+      PID_integral = 0;
+      PID_derivative = 0;
+      PID_last_error = 0;
+      PID_output = 0;
+      Serial.println("OK");
+      Serial.println("STATUS: PID parameters reset");
+      
+    } else {
+      Serial.println("ERROR: Unknown command. Use AT+HELP for available commands");
+    }
+  } else {
+    Serial.println("ERROR: Commands must start with AT+");
+  }
+}
+
+void setup() {
   Serial.begin(115200);
   delay(1000);
 
@@ -183,7 +472,9 @@ void setup()
   pinMode(RELAY_PIN, OUTPUT);
   digitalWrite(RELAY_PIN, LOW); // Initialize relay OFF (LOW = OFF for your relay)
   
-  Serial.println("🔌 Relay initialized on GPIO14 (OFF)");
+  Serial.println("STATUS: ESP8266 BME280 Cooler Controller Ready");
+  Serial.println("STATUS: Relay initialized on GPIO14 (OFF)");
+  Serial.println("STATUS: Send AT+HELP for available commands");
 
   // Initialize I2C with custom pins (SDA = 5, SCL = 4)
   Wire.begin(5, 4); // GPIO5 = D1, GPIO4 = D2
@@ -196,92 +487,51 @@ void setup()
   lcd.setCursor(0, 1);
   lcd.print("Initializing...");
 
-  Serial.println(F("BMP280 test"));
+  Serial.println("STATUS: Initializing BME280 sensor");
 
   // Initialize BME280
-  if (bme.begin(0x76))
-  {
-    Serial.println("BME280 started");
+  if (bme.begin(0x76)) {
+    Serial.println("STATUS: BME280 sensor ready");
     lcd.setCursor(0, 1);
     lcd.print("BME280 Ready!       ");
-  }
-  else
-  {
-    Serial.println("Error initializing BME280");
+  } else {
+    Serial.println("ERROR: BME280 sensor initialization failed");
     lcd.setCursor(0, 1);
     lcd.print("BME280 Error!       ");
   }
   
   delay(2000);
-  
-  // Setup WiFi
-  setupWiFi();
-  
-  // Setup MQTT
-  client.setServer(MQTT_SERVER, MQTT_PORT);
-  client.setCallback(onMqttMessage); // Set callback for incoming messages
-  
-  delay(2000);
   lcd.clear();
   
   // Display cooler thresholds
-  Serial.println("🧊 Cooler Control Configuration:");
-  Serial.print("Start temperature: ");
+  Serial.println("STATUS: Cooler Control Configuration:");
+  Serial.print("STATUS: Start temperature: ");
   Serial.print(COOLER_START_TEMP);
   Serial.println("°C");
-  Serial.print("Stop temperature: ");
+  Serial.print("STATUS: Stop temperature: ");
   Serial.print(COOLER_STOP_TEMP);
   Serial.println("°C");
+  
+  // Reserve string space for serial input
+  inputString.reserve(200);
 }
 
-void loop()
-{
-  // Ensure MQTT connection
-  if (!client.connected()) {
-    reconnectMQTT();
+void loop() {
+  // Process serial commands
+  if (stringComplete) {
+    processSerialCommand(inputString);
+    inputString = "";
+    stringComplete = false;
   }
-  client.loop();
   
   // Read sensor values
   float temperature = bme.readTemperature();
   float humidity = bme.readHumidity();
   float pressure = bme.readPressure() / 100.0F;
   
-  // Control cooler based on temperature
+  // Control cooler based on temperature (if not in manual override)
   controlCooler(temperature);
   
-  // Display on Serial Monitor
-  Serial.print(F("Temperature = "));
-  Serial.print(temperature);
-  Serial.println(" °C");
-
-  Serial.print(F("Humidity = "));
-  Serial.print(humidity);
-  Serial.println(" %");
-
-  Serial.print(F("Pressure = "));
-  Serial.print(pressure);
-  Serial.println(" hPa");
-
-  // Always show timing information if cooler has ever started
-  if (coolerEverStarted) {
-    Serial.print(F("Total elapsed time = "));
-    Serial.print(totalElapsedTime / 1000);
-    Serial.println(" seconds");
-    
-    if (coolerRunning) {
-      Serial.print(F("Cooler runtime = "));
-      Serial.print(coolerRunTime / 1000);
-      Serial.println(" seconds (RUNNING)");
-    } else {
-      Serial.print(F("Last cooler runtime = "));
-      Serial.print(coolerRunTime / 1000);
-      Serial.println(" seconds (STOPPED)");
-    }
-  }
-
-  Serial.println();
-
   // Display on LCD (20x4 format)
   lcd.clear();
   
@@ -321,94 +571,30 @@ void loop()
     lcd.print("Cooler: READY");
   }
   
-  // Line 4: Connection status and uptime
+  // Line 4: System uptime
   lcd.setCursor(0, 3);
-  if (WiFi.status() == WL_CONNECTED && client.connected()) {
-    lcd.print("Online ");
-    lcd.print(millis() / 1000);
-    lcd.print("s");
-  } else {
-    lcd.print("Offline");
-  }
+  lcd.print("Uptime: ");
+  lcd.print(millis() / 1000);
+  lcd.print("s");
 
-  // Publish to MQTT every 5 seconds
+  // Send sensor data via serial every 5 seconds
   unsigned long currentTime = millis();
-  if (currentTime - lastMqttPublish >= MQTT_PUBLISH_INTERVAL) {
-    if (client.connected()) {
-      publishSensorData(temperature, humidity, pressure);
-    }
-    lastMqttPublish = currentTime;
+  if (currentTime - lastDataSend >= DATA_SEND_INTERVAL) {
+    sendSensorData(temperature, humidity, pressure);
+    lastDataSend = currentTime;
   }
 
   delay(2000);
 }
 
-void onMqttMessage(char* topic, byte* payload, unsigned int length) {
-  // Convert payload to string
-  String message = "";
-  for (int i = 0; i < length; i++) {
-    message += (char)payload[i];
-  }
-  
-  Serial.print("MQTT message received on topic: ");
-  Serial.println(topic);
-  Serial.print("Message: ");
-  Serial.println(message);
-  
-  // Check if this is a cooler control command
-  if (String(topic) == "sensors/cooler/control") {
-    if (message == "ON" || message == "on") {
-      manualCoolerControl(true);
-    } else if (message == "OFF" || message == "off") {
-      manualCoolerControl(false);
-    } else if (message == "AUTO" || message == "auto") {
-      // Return to automatic temperature control
-      manualOverride = false;
-      Serial.println("🔄 Cooler returned to automatic temperature control");
-      lcd.setCursor(0, 3);
-      lcd.print("Auto Mode           ");
-      delay(2000);
+// Serial event handler
+void serialEvent() {
+  while (Serial.available()) {
+    char inChar = (char)Serial.read();
+    if (inChar == '\n') {
+      stringComplete = true;
+    } else if (inChar != '\r') {
+      inputString += inChar;
     }
   }
 }
-
-void manualCoolerControl(bool turnOn) {
-  manualOverride = true;
-  
-  if (turnOn && !coolerRunning) {
-    // Turn cooler ON manually
-    digitalWrite(RELAY_PIN, HIGH);
-    coolerRunning = true;
-    
-    if (!coolerEverStarted) {
-      coolerStartTime = millis();
-      coolerEverStarted = true;
-    }
-    
-    Serial.println("🧊 Cooler turned ON manually!");
-    lcd.setCursor(0, 3);
-    lcd.print("Manual: ON          ");
-    
-  } else if (!turnOn && coolerRunning) {
-    // Turn cooler OFF manually
-    digitalWrite(RELAY_PIN, LOW);
-    coolerRunning = false;
-    
-    Serial.println("🛑 Cooler turned OFF manually!");
-    lcd.setCursor(0, 3);
-    lcd.print("Manual: OFF         ");
-  }
-}
-
-void controlCooler(float temperature) {
-  // Skip automatic control if manual override is active
-  if (manualOverride) {
-    // Update timing information even in manual mode
-    if (coolerEverStarted) {
-      totalElapsedTime = millis() - coolerStartTime;
-      if (coolerRunning) {
-        coolerRunTime = totalElapsedTime;
-      }
-    }
-    return;
-  }
